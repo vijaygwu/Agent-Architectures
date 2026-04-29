@@ -44,8 +44,8 @@ This repository contains the complete Python implementations for all code exampl
 | 8 | Guardian Pattern | Policy enforcement, action validation, security boundaries |
 | 9 | Hybrid Architectures | Pattern composition, adaptive selection, fallback strategies |
 | 10 | Agent Identity | JWT authentication, certificate management, identity verification |
-| 11 | Policy Gateway | Request validation, rate limiting, access control |
-| 12 | Complete Example | Research assistant combining all patterns |
+| 11 | Policy Fundamentals | Request validation, policy enforcement, access control |
+| 12 | Research Assistant | Complete example combining all patterns |
 
 ## Getting Started
 
@@ -89,6 +89,12 @@ python ch05-orchestrator/orchestrator.py
 # Run the council deliberation example
 python ch06-council/council.py
 
+# Run the swarm coordination example
+python ch07-swarm/swarm.py
+
+# Run the guardian pattern example
+python ch08-guardian/guardian.py
+
 # Run the complete research assistant
 python ch12-complete-example/research_agents.py
 ```
@@ -96,16 +102,33 @@ python ch12-complete-example/research_agents.py
 ## Key Patterns
 
 ### Orchestrator Pattern (Chapter 5)
-Central coordinator that decomposes complex tasks, assigns work to specialized agents, and synthesizes results.
+Central coordinator that decomposes complex tasks, assigns work to specialized agents, and synthesizes results. Best for well-defined workflows with clear task boundaries.
 
 ### Council Pattern (Chapter 6)
-Multiple agents deliberate together using voting mechanisms to reach decisions on complex, ambiguous problems.
+Multiple agents deliberate together using voting mechanisms to reach decisions on complex, ambiguous problems. Ideal for high-stakes decisions requiring diverse perspectives.
 
 ### Swarm Pattern (Chapter 7)
-Many simple agents coordinate through indirect communication (stigmergy) to solve problems through emergent behavior.
+Many simple agents coordinate through indirect communication (stigmergy) to solve problems through emergent behavior. Effective for exploration and optimization tasks.
 
 ### Guardian Pattern (Chapter 8)
-Specialized agents that monitor, validate, and enforce policies on other agents' actions.
+Specialized agents that monitor, validate, and enforce policies on other agents' actions. Essential for safety, compliance, and resource management.
+
+### Hybrid Architectures (Chapter 9)
+Combine multiple patterns to leverage their complementary strengths. Real-world systems often need orchestration with guardian oversight, or councils that spawn swarms.
+
+## Part Structure
+
+### Part I: Foundations (Chapters 1-4)
+Core concepts of AI agents, the agent loop, multi-agent fundamentals, and communication protocols (MCP, A2A).
+
+### Part II: Patterns (Chapters 5-9)
+The four foundational patterns plus hybrid architectures for complex systems.
+
+### Part III: Governance (Chapters 10-11)
+Agent identity, authentication, and policy enforcement for enterprise deployments.
+
+### Part IV: Complete Example (Chapter 12)
+A production-ready research assistant demonstrating all patterns working together.
 
 ## Related Resources
 
