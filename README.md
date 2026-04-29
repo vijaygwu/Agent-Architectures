@@ -4,13 +4,20 @@
 
 *Design Patterns for Multi-Agent AI Systems*
 
-by Vijay Raghavan
+by Dr. Vijay Raghavan
 
 ---
 
 ## About This Repository
 
 This repository contains the complete Python implementations for all code examples in *Agent Architectures: Design Patterns for Multi-Agent AI Systems*. Each chapter's code is organized in its own directory with working, production-ready implementations.
+
+All code has been reviewed for:
+- **Correctness**: Syntax validation and runtime testing
+- **Async patterns**: Proper use of async/await and resource cleanup
+- **Security**: No hardcoded secrets, proper credential handling
+- **Memory safety**: Bounded collections to prevent leaks
+- **Python compatibility**: Works with Python 3.11+
 
 ## Book Overview
 
@@ -76,6 +83,9 @@ Set your API keys as environment variables:
 ```bash
 export OPENAI_API_KEY="your-openai-key"
 export ANTHROPIC_API_KEY="your-anthropic-key"
+
+# For identity examples (Chapter 10), optionally set:
+export JWT_SECRET="your-secret-key"  # Auto-generated if not set
 ```
 
 ### Running Examples
@@ -139,8 +149,17 @@ A production-ready research assistant demonstrating all patterns working togethe
 
 This code is provided for educational purposes to accompany the book. See LICENSE for details.
 
+## Recent Updates
+
+**April 2025**
+- Fixed async client resource management in council pattern
+- Added memory leak prevention with bounded collections in guardian pattern
+- Improved datetime handling for Python 3.11+ compatibility
+- Added enum deserialization fixes for A2A protocol
+- Enhanced identity module with secure JWT secret handling
+
 ## Author
 
-**Vijay Raghavan**
+**Dr. Vijay Raghavan**
 
 - GitHub: [@vijaygwu](https://github.com/vijaygwu)
