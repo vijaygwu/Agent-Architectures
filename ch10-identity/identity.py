@@ -17,7 +17,7 @@ import asyncio
 import json
 import secrets
 import hashlib
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from dataclasses import dataclass, field
 from enum import Enum
@@ -102,7 +102,9 @@ class AgentIdentity:
         """Check if identity is currently valid"""
         if self.status != IdentityStatus.ACTIVE:
             return False
-        if datetime.fromisoformat(self.expires_at) < datetime.utcnow():
+        # Handle 'Z' suffix for Python <3.11 compatibility
+        expires_str = self.expires_at.replace('Z', '+00:00')
+        if datetime.fromisoformat(expires_str) < datetime.now(timezone.utc):
             return False
         return True
 
@@ -315,7 +317,7 @@ class AgentIdentityService:
 
         # Calculate expiration
         ttl = ttl_days or self.default_ttl_days
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         expires_at = now + timedelta(days=ttl)
 
         # Create identity
@@ -401,7 +403,7 @@ class AgentIdentityService:
             raise ValueError(f"Identity not found: {agent_id}")
 
         identity.status = IdentityStatus.REVOKED
-        identity.revoked_at = datetime.utcnow().isoformat()
+        identity.revoked_at = datetime.now(timezone.utc).isoformat()
         identity.revocation_reason = reason
         await self.store.update_identity(identity)
 
@@ -499,7 +501,7 @@ class AgentIdentityService:
         ttl_hours: int = 24
     ) -> tuple[str, Credential]:
         """Internal token issuance"""
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         expires_at = now + timedelta(hours=ttl_hours)
 
         # Generate token
@@ -555,7 +557,7 @@ class AgentIdentityService:
             raise ValueError("Agent identity is no longer valid")
 
         # Update last used
-        identity.last_used = datetime.utcnow().isoformat()
+        identity.last_used = datetime.now(timezone.utc).isoformat()
         await self.store.update_identity(identity)
 
         return payload
@@ -683,7 +685,7 @@ class AgentIdentityService:
             event_type=event_type,
             agent_id=agent_id,
             actor=actor,
-            timestamp=datetime.utcnow().isoformat(),
+            timestamp=datetime.now(timezone.utc).isoformat(),
             details=details,
             ip_address=ip_address
         )
@@ -758,10 +760,18 @@ async def main():
     # Initialize service
     store = IdentityStore()
     key_vault = KeyVault()
+
+    # In production, load JWT secret from environment or secrets manager
+    # NEVER hardcode secrets in production code
+    import os
+    jwt_secret = os.environ.get("JWT_SECRET", secrets.token_urlsafe(32))
+    if "JWT_SECRET" not in os.environ:
+        print("   WARNING: Using generated JWT secret. Set JWT_SECRET env var in production.")
+
     service = AgentIdentityService(
         store=store,
         key_vault=key_vault,
-        jwt_secret="demo-secret-key-change-in-production"
+        jwt_secret=jwt_secret
     )
     auth = AgentAuthenticator(service)
 

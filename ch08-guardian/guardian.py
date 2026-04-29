@@ -15,7 +15,7 @@ with guardian agents validating network changes before deployment.
 
 import asyncio
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Awaitable
 from dataclasses import dataclass, field
 from enum import Enum
@@ -61,7 +61,7 @@ class Action:
     target: str
     parameters: dict
     context: dict = field(default_factory=dict)
-    timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
     def to_dict(self) -> dict:
         return {
@@ -171,10 +171,11 @@ class RateLimitPolicy(Policy):
         self.max_actions = max_actions
         self.window_seconds = window_seconds
         self._action_times: dict[str, list[datetime]] = {}
+        self._max_tracked_agents = 10000  # Prevent unbounded memory growth
 
     async def check(self, action: Action, context: dict) -> PolicyViolation | None:
         agent_id = action.agent_id
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         window_start = now - timedelta(seconds=self.window_seconds)
 
         # Get recent actions for this agent
@@ -197,6 +198,15 @@ class RateLimitPolicy(Policy):
 
         # Record this action
         self._action_times[agent_id].append(now)
+
+        # Prevent unbounded memory growth - evict oldest agents if limit exceeded
+        if len(self._action_times) > self._max_tracked_agents:
+            oldest_agent = min(
+                self._action_times.keys(),
+                key=lambda a: self._action_times[a][-1] if self._action_times[a] else datetime.min.replace(tzinfo=timezone.utc)
+            )
+            del self._action_times[oldest_agent]
+
         return None
 
 
@@ -293,6 +303,7 @@ class FinancialLimitPolicy(Policy):
         self.max_single = max_single_transaction
         self.max_daily = max_daily_total
         self._daily_totals: dict[str, float] = {}
+        self._max_tracked_days = 7  # Only track last 7 days to prevent memory growth
 
     async def check(self, action: Action, context: dict) -> PolicyViolation | None:
         if action.category != ActionCategory.FINANCIAL:
@@ -311,7 +322,7 @@ class FinancialLimitPolicy(Policy):
 
         # Check daily total
         agent_id = action.agent_id
-        today = datetime.utcnow().date().isoformat()
+        today = datetime.now(timezone.utc).date().isoformat()
         key = f"{agent_id}:{today}"
 
         current_daily = self._daily_totals.get(key, 0)
@@ -329,18 +340,27 @@ class FinancialLimitPolicy(Policy):
 
         # Update daily total
         self._daily_totals[key] = current_daily + amount
+
+        # Clean up old entries to prevent memory growth
+        cutoff_date = (datetime.now(timezone.utc) - timedelta(days=self._max_tracked_days)).date().isoformat()
+        self._daily_totals = {
+            k: v for k, v in self._daily_totals.items()
+            if k.split(":")[-1] >= cutoff_date
+        }
+
         return None
 
 
 class TwoOutOfThreePolicy(Policy):
     """
-    Implements the "two out of three" rule:
-    Agents shouldn't simultaneously:
-    1. Read sensitive data
-    2. Execute code
-    3. Work autonomously
+    Implements a proposed "two out of three" safety heuristic:
+    Agents shouldn't simultaneously have all three of:
+    1. Access to sensitive data
+    2. Ability to execute code
+    3. Autonomous operation without human checkpoints
 
-    Reference: Google Cloud Next 2026 security guidance
+    This is a defense-in-depth principle, not a proven security guarantee.
+    The idea: if at least one capability is constrained, attack surface is reduced.
     """
 
     def __init__(self):
@@ -479,7 +499,7 @@ class GuardianAgent:
             violations=[],
             warnings=warnings,
             reason="Approved" + (" with warnings" if warnings else ""),
-            expires_at=(datetime.utcnow() + timedelta(hours=1)).isoformat()
+            expires_at=(datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
         )
 
     def _get_trust_score(self, agent_id: str) -> TrustScore:
@@ -491,7 +511,7 @@ class GuardianAgent:
                 successful_actions=0,
                 failed_actions=0,
                 violations=0,
-                last_updated=datetime.utcnow().isoformat()
+                last_updated=datetime.now(timezone.utc).isoformat()
             )
         return self._trust_scores[agent_id]
 
@@ -517,7 +537,7 @@ class GuardianAgent:
             else:
                 trust.score = max(0.0, trust.score - 0.02)
 
-        trust.last_updated = datetime.utcnow().isoformat()
+        trust.last_updated = datetime.now(timezone.utc).isoformat()
 
     def _log_action(
         self,
@@ -527,7 +547,7 @@ class GuardianAgent:
     ):
         """Log action for audit trail"""
         self._action_log.append({
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "action": action.to_dict(),
             "violations": [v.to_dict() for v in violations],
             "warnings": [w.to_dict() for w in warnings],

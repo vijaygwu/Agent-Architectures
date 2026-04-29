@@ -15,7 +15,7 @@ import asyncio
 import json
 import uuid
 import httpx
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Literal
 from dataclasses import dataclass, field, asdict
 from enum import Enum
@@ -314,7 +314,7 @@ class A2AClient:
 
         # Create task
         task_id = str(uuid.uuid4())
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
 
         initial_msg = A2AMessage(
             id=str(uuid.uuid4()),
@@ -371,7 +371,7 @@ class A2AClient:
             id=str(uuid.uuid4()),
             role=MessageRole.USER,
             content=message,
-            timestamp=datetime.utcnow().isoformat(),
+            timestamp=datetime.now(timezone.utc).isoformat(),
             metadata=metadata or {}
         )
 
@@ -383,7 +383,7 @@ class A2AClient:
         response.raise_for_status()
 
         task.messages.append(msg)
-        task.updated_at = datetime.utcnow().isoformat()
+        task.updated_at = datetime.now(timezone.utc).isoformat()
 
         # Add agent response
         response_data = response.json()
@@ -421,7 +421,7 @@ class A2AClient:
         task.state = TaskState(data["state"])
         task.result = data.get("result")
         task.error = data.get("error")
-        task.updated_at = data.get("updated_at", datetime.utcnow().isoformat())
+        task.updated_at = data.get("updated_at", datetime.now(timezone.utc).isoformat())
 
         return task
 
@@ -442,7 +442,7 @@ class A2AClient:
         response.raise_for_status()
 
         task.state = TaskState.CANCELLED
-        task.updated_at = datetime.utcnow().isoformat()
+        task.updated_at = datetime.now(timezone.utc).isoformat()
 
         return task
 
@@ -628,16 +628,23 @@ class InventoryAgentHandler(A2ATaskHandler):
         # Parse the initial request
         initial_message = messages[0]["content"]
 
-        # Create task record
+        # Create task record - convert role strings to enums
+        parsed_messages = []
+        for m in messages:
+            msg_data = dict(m)
+            if isinstance(msg_data.get("role"), str):
+                msg_data["role"] = MessageRole(msg_data["role"])
+            parsed_messages.append(A2AMessage(**msg_data))
+
         task = A2ATask(
             id=task_id,
             source_agent=task_data["source_agent"],
             target_agent=task_data["target_agent"],
             capability=capability,
             state=TaskState.IN_PROGRESS,
-            messages=[A2AMessage(**m) for m in messages],
+            messages=parsed_messages,
             created_at=task_data["created_at"],
-            updated_at=datetime.utcnow().isoformat()
+            updated_at=datetime.now(timezone.utc).isoformat()
         )
 
         # Handle based on capability
@@ -658,7 +665,7 @@ class InventoryAgentHandler(A2ATaskHandler):
             id=str(uuid.uuid4()),
             role=MessageRole.AGENT,
             content=json.dumps(result),
-            timestamp=datetime.utcnow().isoformat()
+            timestamp=datetime.now(timezone.utc).isoformat()
         )
         task.messages.append(response_msg)
         task.state = TaskState.COMPLETED
@@ -721,10 +728,10 @@ class InventoryAgentHandler(A2ATaskHandler):
             id=str(uuid.uuid4()),
             role=MessageRole.AGENT,
             content=response_content,
-            timestamp=datetime.utcnow().isoformat()
+            timestamp=datetime.now(timezone.utc).isoformat()
         )
         task.messages.append(response_msg)
-        task.updated_at = datetime.utcnow().isoformat()
+        task.updated_at = datetime.now(timezone.utc).isoformat()
 
         return task
 

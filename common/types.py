@@ -3,9 +3,13 @@ Common types used across Book 1 code examples.
 """
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
+
+
+# Default model - update this when new models are released
+DEFAULT_MODEL = "claude-sonnet-4-20250514"
 
 
 class AgentRole(Enum):
@@ -44,7 +48,7 @@ class AgentMessage:
     recipient_id: str
     message_type: MessageType
     content: Dict[str, Any]
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     correlation_id: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
@@ -57,7 +61,7 @@ class AgentState:
     status: str
     current_task: Optional[str] = None
     memory: Dict[str, Any] = field(default_factory=dict)
-    last_active: datetime = field(default_factory=datetime.utcnow)
+    last_active: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 @dataclass
@@ -86,7 +90,7 @@ class AgentConfig:
     agent_id: str
     name: str
     role: AgentRole
-    model: str = "gpt-4"
+    model: str = DEFAULT_MODEL
     temperature: float = 0.7
     max_tokens: int = 4096
     tools: List[Tool] = field(default_factory=list)

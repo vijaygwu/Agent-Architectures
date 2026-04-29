@@ -16,6 +16,9 @@ httpx>=0.26
 openai>=1.12
 anthropic>=0.18
 
+# LangGraph for orchestration
+langgraph>=0.0.40
+
 # Caching
 aiocache>=0.12
 

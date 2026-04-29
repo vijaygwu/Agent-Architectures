@@ -14,12 +14,12 @@ Use this pattern when single-agent decisions aren't trustworthy enough.
 
 import asyncio
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Literal
 from dataclasses import dataclass, field
 from enum import Enum
 import uuid
-import anthropic
+from anthropic import AsyncAnthropic
 
 
 # =============================================================================
@@ -167,7 +167,11 @@ class CouncilMember:
         self.expertise = expertise
         self.persona = persona
         self.model = model
-        self.client = anthropic.Anthropic()
+        self.client = AsyncAnthropic()
+
+    async def close(self):
+        """Close the client connection to prevent resource leaks."""
+        await self.client.close()
 
     async def propose(
         self,
@@ -203,7 +207,7 @@ Respond in JSON format:
             for p in previous_proposals:
                 user_content += f"- {p.member_id}: {p.content}\n"
 
-        response = self.client.messages.create(
+        response = await self.client.messages.create(
             model=self.model,
             max_tokens=1024,
             system=system_prompt,
@@ -227,7 +231,7 @@ Respond in JSON format:
             content=result.get("proposal", ""),
             reasoning=result.get("reasoning", ""),
             confidence=result.get("confidence", 0.5),
-            timestamp=datetime.utcnow().isoformat(),
+            timestamp=datetime.now(timezone.utc).isoformat(),
             supporting_evidence=result.get("supporting_evidence", [])
         )
 
@@ -268,7 +272,7 @@ Confidence: {proposal.confidence}
 
 Context: {json.dumps(context)}"""
 
-        response = self.client.messages.create(
+        response = await self.client.messages.create(
             model=self.model,
             max_tokens=1024,
             system=system_prompt,
@@ -291,7 +295,7 @@ Context: {json.dumps(context)}"""
             assessment=result.get("assessment", "neutral"),
             concerns=result.get("concerns", []),
             suggestions=result.get("suggestions", []),
-            timestamp=datetime.utcnow().isoformat()
+            timestamp=datetime.now(timezone.utc).isoformat()
         )
 
     async def vote(
@@ -326,7 +330,7 @@ Proposal:
 Critiques:
 {critiques_text}"""
 
-        response = self.client.messages.create(
+        response = await self.client.messages.create(
             model=self.model,
             max_tokens=512,
             system=system_prompt,
@@ -343,7 +347,7 @@ Critiques:
             proposal_id=proposal.id,
             vote=result.get("vote", "abstain"),
             reasoning=result.get("reasoning", ""),
-            timestamp=datetime.utcnow().isoformat()
+            timestamp=datetime.now(timezone.utc).isoformat()
         )
 
 
@@ -370,6 +374,19 @@ class Council:
         self.config = config
         self.members = members
         self.deliberation_log: list[DeliberationRound] = []
+
+    async def close(self):
+        """Close all member clients to prevent resource leaks."""
+        for member in self.members:
+            await member.close()
+
+    async def __aenter__(self):
+        """Support async context manager."""
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Ensure cleanup on context exit."""
+        await self.close()
 
     async def deliberate(
         self,
@@ -432,7 +449,7 @@ class Council:
             deliberation_rounds=self.deliberation_log,
             dissenting_opinions=dissenting,
             requires_human_approval=requires_human,
-            timestamp=datetime.utcnow().isoformat()
+            timestamp=datetime.now(timezone.utc).isoformat()
         )
 
     async def _run_deliberation_round(
@@ -659,7 +676,7 @@ class Council:
             deliberation_rounds=self.deliberation_log,
             dissenting_opinions=[],
             requires_human_approval=True,
-            timestamp=datetime.utcnow().isoformat()
+            timestamp=datetime.now(timezone.utc).isoformat()
         )
 
 

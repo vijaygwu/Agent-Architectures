@@ -6,13 +6,13 @@ A complete Model Context Protocol server for enterprise tool integration.
 This example implements an MCP server that exposes procurement tools
 to AI applications following the official MCP specification.
 
-Reference: https://modelcontextprotocol.io/specification/2025-11-25
+Reference: https://modelcontextprotocol.io/specification/2024-11-05
 """
 
 import asyncio
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Sequence
 from dataclasses import dataclass, asdict
 
@@ -150,7 +150,7 @@ class ProcurementDatabase:
             currency="USD",
             status="pending_approval",
             created_by=created_by,
-            created_at=datetime.utcnow().isoformat(),
+            created_at=datetime.now(timezone.utc).isoformat(),
             approver=approver
         )
 
@@ -165,7 +165,7 @@ class ProcurementDatabase:
         if po:
             po.status = status
             if status == "approved":
-                po.approved_at = datetime.utcnow().isoformat()
+                po.approved_at = datetime.now(timezone.utc).isoformat()
         return po
 
 
@@ -482,7 +482,7 @@ async def read_resource(uri: str) -> str:
         vendors = await db.search_vendors()
         return json.dumps({
             "catalog_version": "2024.1",
-            "last_updated": datetime.utcnow().isoformat(),
+            "last_updated": datetime.now(timezone.utc).isoformat(),
             "vendors": [v.to_dict() for v in vendors]
         }, indent=2)
 
