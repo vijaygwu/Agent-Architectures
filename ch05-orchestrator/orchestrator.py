@@ -15,7 +15,7 @@ This implementation uses LangGraph for the orchestration graph.
 import asyncio
 import json
 import operator
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Annotated, Any, Literal, TypedDict
 from dataclasses import dataclass, field
 from enum import Enum
@@ -139,7 +139,7 @@ class ResearchWorker(BaseWorker):
             "metadata": {
                 "search_queries": 3,
                 "documents_analyzed": 5,
-                "timestamp": datetime.utcnow().isoformat()
+                "timestamp": datetime.now(timezone.utc).isoformat()
             }
         }
 

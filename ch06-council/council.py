@@ -759,7 +759,7 @@ def create_business_council() -> Council:
 async def main():
     """Demonstrate council deliberation"""
 
-    # Create technical council
+    # Create technical council with context manager to ensure cleanup
     council = create_technical_council()
 
     # Question for deliberation
@@ -780,40 +780,43 @@ async def main():
         "risk_tolerance": "medium"
     }
 
-    print("=" * 60)
-    print("Council Deliberation Demo")
-    print("=" * 60)
-    print(f"\nQuestion: {question[:100]}...")
-    print(f"\nCouncil: {council.config.name}")
-    print(f"Members: {[m.name for m in council.members]}")
-    print(f"Voting Method: {council.config.voting_method.value}")
+    try:
+        print("=" * 60)
+        print("Council Deliberation Demo")
+        print("=" * 60)
+        print(f"\nQuestion: {question[:100]}...")
+        print(f"\nCouncil: {council.config.name}")
+        print(f"Members: {[m.name for m in council.members]}")
+        print(f"Voting Method: {council.config.voting_method.value}")
 
-    # Run deliberation
-    print("\nDeliberating...")
-    decision = await council.deliberate(
-        question=question,
-        context=context,
-        impact_level="high"
-    )
+        # Run deliberation
+        print("\nDeliberating...")
+        decision = await council.deliberate(
+            question=question,
+            context=context,
+            impact_level="high"
+        )
 
-    print("\n" + "=" * 60)
-    print("DECISION")
-    print("=" * 60)
-    print(f"\nDecision ID: {decision.decision_id}")
-    print(f"Outcome: {decision.decision}")
-    print(f"Confidence: {decision.confidence:.2f}")
-    print(f"Requires Human Approval: {decision.requires_human_approval}")
+        print("\n" + "=" * 60)
+        print("DECISION")
+        print("=" * 60)
+        print(f"\nDecision ID: {decision.decision_id}")
+        print(f"Outcome: {decision.decision}")
+        print(f"Confidence: {decision.confidence:.2f}")
+        print(f"Requires Human Approval: {decision.requires_human_approval}")
 
-    print(f"\nDeliberation Rounds: {len(decision.deliberation_rounds)}")
-    for round_info in decision.deliberation_rounds:
-        print(f"  Round {round_info.round_number}: {round_info.outcome}")
-        print(f"    Proposals: {len(round_info.proposals)}")
-        print(f"    Critiques: {len(round_info.critiques)}")
+        print(f"\nDeliberation Rounds: {len(decision.deliberation_rounds)}")
+        for round_info in decision.deliberation_rounds:
+            print(f"  Round {round_info.round_number}: {round_info.outcome}")
+            print(f"    Proposals: {len(round_info.proposals)}")
+            print(f"    Critiques: {len(round_info.critiques)}")
 
-    if decision.dissenting_opinions:
-        print(f"\nDissenting Opinions: {len(decision.dissenting_opinions)}")
-        for dissent in decision.dissenting_opinions:
-            print(f"  - {dissent['member_id']}: {dissent['concerns'][:2]}")
+        if decision.dissenting_opinions:
+            print(f"\nDissenting Opinions: {len(decision.dissenting_opinions)}")
+            for dissent in decision.dissenting_opinions:
+                print(f"  - {dissent['member_id']}: {dissent['concerns'][:2]}")
+    finally:
+        await council.close()
 
 
 if __name__ == "__main__":

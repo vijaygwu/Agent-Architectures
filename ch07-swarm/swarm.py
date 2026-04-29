@@ -372,7 +372,7 @@ class SwarmAgent:
         if asyncio.iscoroutinefunction(self.task_handler):
             return await self.task_handler(task)
         else:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             return await loop.run_in_executor(None, self.task_handler, task)
 
     async def request_assistance(self, task: SwarmTask, reason: str):

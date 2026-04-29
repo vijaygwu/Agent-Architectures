@@ -792,7 +792,12 @@ INVENTORY_AGENT_CARD = AgentCard(
 # =============================================================================
 
 async def example_usage():
-    """Demonstrate A2A protocol usage"""
+    """Demonstrate A2A protocol usage.
+
+    NOTE: This example requires a running A2A server at the target agent's
+    endpoint. For standalone testing, the create_task call is commented out
+    and replaced with a simulated response.
+    """
 
     # Create A2A client for the procurement agent
     client = A2AClient(
@@ -811,11 +816,27 @@ async def example_usage():
 
         # 2. Create a task to check stock
         print("\nCreating stock check task...")
-        task = await client.create_task(
+        # NOTE: Uncomment the following when a server is running:
+        # task = await client.create_task(
+        #     target_agent="inventory-agent",
+        #     capability="check_stock",
+        #     initial_message="Check stock levels for all widgets",
+        #     metadata={"priority": "high", "requester": "po-workflow"}
+        # )
+
+        # Simulated task response for standalone demo
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+        task = A2ATask(
+            id="task-demo-001",
+            source_agent=client.agent_id,
             target_agent="inventory-agent",
             capability="check_stock",
-            initial_message="Check stock levels for all widgets",
-            metadata={"priority": "high", "requester": "po-workflow"}
+            state=TaskState.COMPLETED,
+            messages=[],
+            created_at=now,
+            updated_at=now,
+            result={"stock_level": 150, "status": "in_stock"}
         )
         print(f"Task created: {task.id}")
         print(f"State: {task.state}")

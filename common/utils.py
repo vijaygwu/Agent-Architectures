@@ -4,7 +4,7 @@ Common utilities used across Book 1 code examples.
 
 import asyncio
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import wraps
 from typing import Any, Callable, TypeVar
 
@@ -20,7 +20,7 @@ def generate_id(prefix: str = "") -> str:
 def format_timestamp(dt: datetime = None) -> str:
     """Format a datetime as ISO 8601 string."""
     if dt is None:
-        dt = datetime.utcnow()
+        dt = datetime.now(timezone.utc)
     return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
@@ -60,11 +60,11 @@ class Timer:
         self.elapsed_ms: float = 0
 
     async def __aenter__(self):
-        self.start_time = asyncio.get_event_loop().time()
+        self.start_time = asyncio.get_running_loop().time()
         return self
 
     async def __aexit__(self, *args):
-        self.end_time = asyncio.get_event_loop().time()
+        self.end_time = asyncio.get_running_loop().time()
         self.elapsed_ms = (self.end_time - self.start_time) * 1000
 
 

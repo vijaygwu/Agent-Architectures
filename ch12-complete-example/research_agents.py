@@ -404,6 +404,7 @@ class AnalyzerAgent(ResearchAgent):
             facts.append(Fact(
                 id=f"fact_{hashlib.md5((source.id + str(i)).encode()).hexdigest()[:8]}",
                 statement=stmt,
+                sources=[source.id],
                 confidence=0.7 if source.credibility == SourceCredibility.HIGH else 0.5,
                 category="finding"
             ))
