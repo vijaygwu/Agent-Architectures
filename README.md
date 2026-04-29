@@ -151,6 +151,13 @@ This code is provided for educational purposes to accompany the book. See LICENS
 
 ## Recent Updates
 
+**April 2026**
+- Replaced deprecated `datetime.utcnow()` with `datetime.now(timezone.utc)` (Python 3.12+ compatible)
+- Replaced deprecated `asyncio.get_event_loop()` with `asyncio.get_running_loop()` (Python 3.10+ compatible)
+- Added proper resource cleanup with `council.close()` and try/finally patterns
+- Fixed A2A client simulated task to use correct field names (`source_agent`/`target_agent`)
+- All code passes 3-iteration automated review gauntlet with 0 Critical/Major issues
+
 **April 2025**
 - Fixed async client resource management in council pattern
 - Added memory leak prevention with bounded collections in guardian pattern
