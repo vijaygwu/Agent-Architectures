@@ -1,858 +1,1049 @@
 """
-Chapter 11: Policy Gateway Implementation
-=========================================
+Chapter 11: Policy Fundamentals
+===============================
 
-Implements a policy enforcement gateway for AI agents that provides:
-- Request/response filtering
-- Rate limiting and quotas
-- Policy-based access control
-- Audit logging
-- Content moderation
+Implements policy enforcement for AI agents including:
+- Policy definition with conditions and actions
+- Rate limiting
+- Content filtering
+- Budget/quota policies
+- Policy gateway for centralized enforcement
+- Human-in-the-loop approval workflows
+- Policy testing and simulation
+- Policy observability
 
-Based on enterprise API gateway patterns adapted for AI agents.
+Based on Chapter 11 of the Agent Architectures book.
 """
 
 import asyncio
-import time
-import re
-import hashlib
 import json
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Any, Callable, Optional
+import re
 from collections import defaultdict
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from enum import Enum
+from secrets import token_urlsafe
+from typing import Any, Callable
 
 
-class PolicyDecision(Enum):
-    """Possible policy evaluation outcomes."""
+# =============================================================================
+# Policy Definition (Section 11.4)
+# =============================================================================
+
+class PolicyAction(Enum):
+    """Actions a policy rule can trigger"""
     ALLOW = "allow"
     DENY = "deny"
+    RATE_LIMIT = "rate_limit"
     REQUIRE_APPROVAL = "require_approval"
-    MODIFY = "modify"  # Allow with modifications
-    AUDIT = "audit"    # Allow but log for review
-
-
-class PolicyPriority(Enum):
-    """Policy evaluation priority."""
-    CRITICAL = 0   # Security-critical, evaluated first
-    HIGH = 1       # Important business rules
-    MEDIUM = 2     # Standard policies
-    LOW = 3        # Advisory policies
+    LOG = "log"
 
 
 @dataclass
-class PolicyContext:
-    """Context for policy evaluation."""
-    agent_id: str
-    action: str
-    resource: str
-    payload: dict
-    metadata: dict = field(default_factory=dict)
-    timestamp: float = field(default_factory=time.time)
-    request_id: str = ""
+class PolicyCondition:
+    """A condition that must be met for the policy to apply."""
+    field: str              # e.g., "agent.role", "request.resource"
+    operator: str           # e.g., "equals", "contains", "greater_than"
+    value: Any
+
+    def evaluate(self, context: dict) -> bool:
+        """Evaluate condition against context."""
+        actual = self._get_field(context, self.field)
+
+        if self.operator == "equals":
+            return actual == self.value
+        elif self.operator == "not_equals":
+            return actual != self.value
+        elif self.operator == "contains":
+            return actual is not None and self.value in actual
+        elif self.operator == "greater_than":
+            return actual is not None and actual > self.value
+        elif self.operator == "less_than":
+            return actual is not None and actual < self.value
+        elif self.operator == "in":
+            return actual in self.value
+        elif self.operator == "matches":
+            return bool(re.match(self.value, str(actual)))
+
+        return False
+
+    def _get_field(self, context: dict, field: str) -> Any:
+        """Navigate nested fields like 'agent.role'."""
+        parts = field.split(".")
+        value = context
+        for part in parts:
+            if isinstance(value, dict):
+                value = value.get(part)
+            else:
+                value = getattr(value, part, None)
+        return value
+
+
+@dataclass
+class Policy:
+    """A policy that controls agent behavior."""
+    id: str
+    name: str
+    description: str
+    conditions: list[PolicyCondition]
+    action: PolicyAction
+    action_params: dict = field(default_factory=dict)
+    priority: int = 0  # Higher = evaluated first
+    enabled: bool = True
+
+    def applies(self, context: dict) -> bool:
+        """Check if this policy applies to the given context."""
+        if not self.enabled:
+            return False
+        return all(c.evaluate(context) for c in self.conditions)
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "description": self.description,
+            "action": self.action.value,
+            "priority": self.priority
+        }
+
+
+# =============================================================================
+# Rate Limiting (Section 11.5.1)
+# =============================================================================
+
+class RateLimitPolicy:
+    def __init__(
+        self,
+        max_requests: int,
+        window_seconds: int,
+        scope: str = "global"  # "global", "per_agent", "per_resource"
+    ):
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self.scope = scope
+        self.requests: dict[str, list[datetime]] = defaultdict(list)
+
+    def check(self, context: dict) -> tuple[bool, dict]:
+        """Check if request is within rate limit."""
+        key = self._get_key(context)
+        now = datetime.utcnow()
+        window_start = now - timedelta(seconds=self.window_seconds)
+
+        # Clean old requests
+        self.requests[key] = [
+            t for t in self.requests[key]
+            if t > window_start
+        ]
+
+        if len(self.requests[key]) >= self.max_requests:
+            retry_after = (self.requests[key][0] - window_start).total_seconds()
+            return False, {
+                "reason": "rate_limit_exceeded",
+                "limit": self.max_requests,
+                "window_seconds": self.window_seconds,
+                "retry_after": retry_after
+            }
+
+        self.requests[key].append(now)
+        return True, {"remaining": self.max_requests - len(self.requests[key])}
+
+    def _get_key(self, context: dict) -> str:
+        if self.scope == "global":
+            return "global"
+        elif self.scope == "per_agent":
+            return context.get("agent_id", "unknown")
+        elif self.scope == "per_resource":
+            return context.get("resource", "unknown")
+        return "global"
+
+
+# =============================================================================
+# Content Filtering (Section 11.5.2)
+# =============================================================================
+
+@dataclass
+class ContentRule:
+    name: str
+    pattern: str  # Regex pattern
+    action: str   # "block" or "redact"
+    violation_message: str
+    contexts: list[str] = None  # None = all contexts
+
+    def applies(self, context: dict) -> bool:
+        if self.contexts is None:
+            return True
+        return context.get("type") in self.contexts
+
+    def matches(self, text: str) -> bool:
+        return bool(re.search(self.pattern, text, re.IGNORECASE))
+
+    def filter(self, text: str) -> str:
+        if self.action == "redact":
+            return re.sub(self.pattern, "[REDACTED]", text, flags=re.IGNORECASE)
+        return text
+
+
+class ContentPolicy:
+    def __init__(self):
+        self.rules: list[ContentRule] = []
+
+    def add_rule(self, rule: "ContentRule"):
+        self.rules.append(rule)
+
+    def check(self, content: Any, context: dict) -> tuple[bool, list[str]]:
+        """Check content against all rules."""
+        violations = []
+
+        text = self._extract_text(content)
+
+        for rule in self.rules:
+            if rule.applies(context) and rule.matches(text):
+                violations.append(rule.violation_message)
+
+        return len(violations) == 0, violations
+
+    def filter(self, content: Any, context: dict) -> Any:
+        """Filter/redact violating content."""
+        text = self._extract_text(content)
+
+        for rule in self.rules:
+            if rule.applies(context):
+                text = rule.filter(text)
+
+        return text
+
+    def _extract_text(self, content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        elif isinstance(content, dict):
+            return json.dumps(content)
+        return str(content)
+
+
+# =============================================================================
+# Budget/Quota Policies (Section 11.5.3)
+# =============================================================================
+
+@dataclass
+class BudgetPolicy:
+    max_amount: float
+    period: str  # "request", "hour", "day", "month"
+    resource: str  # "tokens", "dollars", "api_calls"
 
     def __post_init__(self):
-        if not self.request_id:
-            self.request_id = hashlib.sha256(
-                f"{self.agent_id}:{self.action}:{self.timestamp}".encode()
-            ).hexdigest()[:16]
+        self.usage: dict[str, float] = defaultdict(float)
+        self.period_start: dict[str, datetime] = {}
 
+    def check(self, agent_id: str, amount: float) -> tuple[bool, dict]:
+        """Check if usage would exceed budget."""
+        key = f"{agent_id}:{self.period}"
 
-@dataclass
-class PolicyResult:
-    """Result of policy evaluation."""
-    decision: PolicyDecision
-    policy_id: str
-    reason: str
-    modifications: Optional[dict] = None
-    required_approvers: Optional[list[str]] = None
-    audit_data: Optional[dict] = None
+        # Reset if period expired
+        if self._period_expired(key):
+            self.usage[key] = 0
+            self.period_start[key] = datetime.utcnow()
 
-
-@dataclass
-class AuditEntry:
-    """Audit log entry."""
-    request_id: str
-    agent_id: str
-    action: str
-    resource: str
-    decision: PolicyDecision
-    policy_id: str
-    reason: str
-    timestamp: float = field(default_factory=time.time)
-    payload_hash: str = ""
-    response_hash: str = ""
-    latency_ms: float = 0.0
-
-
-class Policy(ABC):
-    """Base class for all policies."""
-
-    def __init__(self, policy_id: str, priority: PolicyPriority = PolicyPriority.MEDIUM):
-        self.policy_id = policy_id
-        self.priority = priority
-        self.enabled = True
-        self.stats = {"evaluations": 0, "denials": 0, "approvals": 0}
-
-    @abstractmethod
-    async def evaluate(self, context: PolicyContext) -> PolicyResult:
-        """Evaluate the policy against the given context."""
-        pass
-
-    @abstractmethod
-    def applies_to(self, context: PolicyContext) -> bool:
-        """Check if this policy applies to the given context."""
-        pass
-
-
-class RateLimitPolicy(Policy):
-    """
-    Rate limiting policy using token bucket algorithm.
-    """
-
-    def __init__(self,
-                 policy_id: str,
-                 requests_per_minute: int = 60,
-                 burst_size: int = 10):
-        super().__init__(policy_id, PolicyPriority.HIGH)
-        self.requests_per_minute = requests_per_minute
-        self.burst_size = burst_size
-        self.buckets: dict[str, dict] = {}  # agent_id -> bucket state
-        self._lock = asyncio.Lock()
-
-    async def evaluate(self, context: PolicyContext) -> PolicyResult:
-        self.stats["evaluations"] += 1
-
-        async with self._lock:
-            bucket = self._get_or_create_bucket(context.agent_id)
-
-            # Refill tokens based on time passed
-            now = time.time()
-            time_passed = now - bucket["last_refill"]
-            tokens_to_add = time_passed * (self.requests_per_minute / 60.0)
-            bucket["tokens"] = min(self.burst_size, bucket["tokens"] + tokens_to_add)
-            bucket["last_refill"] = now
-
-            # Check if request can proceed
-            if bucket["tokens"] >= 1:
-                bucket["tokens"] -= 1
-                self.stats["approvals"] += 1
-                return PolicyResult(
-                    decision=PolicyDecision.ALLOW,
-                    policy_id=self.policy_id,
-                    reason="Rate limit check passed"
-                )
-            else:
-                self.stats["denials"] += 1
-                return PolicyResult(
-                    decision=PolicyDecision.DENY,
-                    policy_id=self.policy_id,
-                    reason=f"Rate limit exceeded: {self.requests_per_minute}/min",
-                    audit_data={"tokens_remaining": bucket["tokens"]}
-                )
-
-    def _get_or_create_bucket(self, agent_id: str) -> dict:
-        if agent_id not in self.buckets:
-            self.buckets[agent_id] = {
-                "tokens": self.burst_size,
-                "last_refill": time.time()
+        current = self.usage[key]
+        if current + amount > self.max_amount:
+            return False, {
+                "reason": "budget_exceeded",
+                "current": current,
+                "requested": amount,
+                "limit": self.max_amount,
+                "resource": self.resource
             }
-        return self.buckets[agent_id]
 
-    def applies_to(self, context: PolicyContext) -> bool:
-        return True  # Applies to all requests
-
-
-class QuotaPolicy(Policy):
-    """
-    Quota policy for limiting resource usage over time.
-    """
-
-    def __init__(self,
-                 policy_id: str,
-                 daily_limit: int = 1000,
-                 monthly_limit: int = 25000):
-        super().__init__(policy_id, PolicyPriority.HIGH)
-        self.daily_limit = daily_limit
-        self.monthly_limit = monthly_limit
-        self.usage: dict[str, dict] = {}  # agent_id -> usage tracking
-
-    async def evaluate(self, context: PolicyContext) -> PolicyResult:
-        self.stats["evaluations"] += 1
-
-        usage = self._get_or_create_usage(context.agent_id)
-        self._reset_if_needed(usage)
-
-        # Check limits
-        if usage["daily"] >= self.daily_limit:
-            self.stats["denials"] += 1
-            return PolicyResult(
-                decision=PolicyDecision.DENY,
-                policy_id=self.policy_id,
-                reason=f"Daily quota exceeded: {self.daily_limit}",
-                audit_data={"daily_usage": usage["daily"]}
-            )
-
-        if usage["monthly"] >= self.monthly_limit:
-            self.stats["denials"] += 1
-            return PolicyResult(
-                decision=PolicyDecision.DENY,
-                policy_id=self.policy_id,
-                reason=f"Monthly quota exceeded: {self.monthly_limit}",
-                audit_data={"monthly_usage": usage["monthly"]}
-            )
-
-        # Increment usage
-        usage["daily"] += 1
-        usage["monthly"] += 1
-
-        self.stats["approvals"] += 1
-        return PolicyResult(
-            decision=PolicyDecision.ALLOW,
-            policy_id=self.policy_id,
-            reason="Quota check passed",
-            audit_data={
-                "daily_remaining": self.daily_limit - usage["daily"],
-                "monthly_remaining": self.monthly_limit - usage["monthly"]
-            }
-        )
-
-    def _get_or_create_usage(self, agent_id: str) -> dict:
-        if agent_id not in self.usage:
-            now = datetime.now()
-            self.usage[agent_id] = {
-                "daily": 0,
-                "monthly": 0,
-                "daily_reset": now.date(),
-                "monthly_reset": now.replace(day=1).date()
-            }
-        return self.usage[agent_id]
-
-    def _reset_if_needed(self, usage: dict):
-        now = datetime.now()
-        if now.date() > usage["daily_reset"]:
-            usage["daily"] = 0
-            usage["daily_reset"] = now.date()
-        if now.date() >= (usage["monthly_reset"] + timedelta(days=32)).replace(day=1):
-            usage["monthly"] = 0
-            usage["monthly_reset"] = now.replace(day=1).date()
-
-    def applies_to(self, context: PolicyContext) -> bool:
-        return True
-
-
-class ContentPolicy(Policy):
-    """
-    Content filtering policy for input/output moderation.
-    """
-
-    def __init__(self,
-                 policy_id: str,
-                 blocked_patterns: list[str] = None,
-                 pii_detection: bool = True):
-        super().__init__(policy_id, PolicyPriority.CRITICAL)
-        self.blocked_patterns = [re.compile(p, re.IGNORECASE)
-                                 for p in (blocked_patterns or [])]
-        self.pii_detection = pii_detection
-
-        # Common PII patterns
-        self.pii_patterns = {
-            "ssn": re.compile(r'\b\d{3}-\d{2}-\d{4}\b'),
-            "credit_card": re.compile(r'\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b'),
-            "email": re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'),
-            "phone": re.compile(r'\b\d{3}[-.]?\d{3}[-.]?\d{4}\b'),
-            "api_key": re.compile(r'\b[A-Za-z0-9]{32,}\b')  # Generic API key pattern
+        return True, {
+            "current": current,
+            "remaining": self.max_amount - current - amount
         }
 
-    async def evaluate(self, context: PolicyContext) -> PolicyResult:
-        self.stats["evaluations"] += 1
+    def record(self, agent_id: str, amount: float):
+        """Record usage."""
+        key = f"{agent_id}:{self.period}"
+        self.usage[key] += amount
 
-        content = json.dumps(context.payload)
-
-        # Check blocked patterns
-        for pattern in self.blocked_patterns:
-            if pattern.search(content):
-                self.stats["denials"] += 1
-                return PolicyResult(
-                    decision=PolicyDecision.DENY,
-                    policy_id=self.policy_id,
-                    reason=f"Content contains blocked pattern: {pattern.pattern}"
-                )
-
-        # Check for PII
-        if self.pii_detection:
-            pii_found = []
-            for pii_type, pattern in self.pii_patterns.items():
-                if pattern.search(content):
-                    pii_found.append(pii_type)
-
-            if pii_found:
-                self.stats["denials"] += 1
-                return PolicyResult(
-                    decision=PolicyDecision.MODIFY,
-                    policy_id=self.policy_id,
-                    reason=f"PII detected: {', '.join(pii_found)}",
-                    modifications={"redact_pii": pii_found},
-                    audit_data={"pii_types": pii_found}
-                )
-
-        self.stats["approvals"] += 1
-        return PolicyResult(
-            decision=PolicyDecision.ALLOW,
-            policy_id=self.policy_id,
-            reason="Content policy check passed"
-        )
-
-    def applies_to(self, context: PolicyContext) -> bool:
-        return True
-
-
-class AccessControlPolicy(Policy):
-    """
-    Role-based access control policy.
-    """
-
-    def __init__(self,
-                 policy_id: str,
-                 permissions: dict[str, dict[str, list[str]]] = None):
-        super().__init__(policy_id, PolicyPriority.CRITICAL)
-        # permissions: {role: {resource_pattern: [allowed_actions]}}
-        self.permissions = permissions or {}
-        self.agent_roles: dict[str, list[str]] = {}
-
-    def assign_role(self, agent_id: str, roles: list[str]):
-        """Assign roles to an agent."""
-        self.agent_roles[agent_id] = roles
-
-    async def evaluate(self, context: PolicyContext) -> PolicyResult:
-        self.stats["evaluations"] += 1
-
-        roles = self.agent_roles.get(context.agent_id, ["default"])
-
-        for role in roles:
-            if role in self.permissions:
-                role_perms = self.permissions[role]
-                for resource_pattern, allowed_actions in role_perms.items():
-                    if self._match_resource(context.resource, resource_pattern):
-                        if context.action in allowed_actions or "*" in allowed_actions:
-                            self.stats["approvals"] += 1
-                            return PolicyResult(
-                                decision=PolicyDecision.ALLOW,
-                                policy_id=self.policy_id,
-                                reason=f"Access granted via role: {role}"
-                            )
-
-        self.stats["denials"] += 1
-        return PolicyResult(
-            decision=PolicyDecision.DENY,
-            policy_id=self.policy_id,
-            reason=f"Access denied: no permission for {context.action} on {context.resource}",
-            audit_data={"agent_roles": roles}
-        )
-
-    def _match_resource(self, resource: str, pattern: str) -> bool:
-        """Match resource against pattern (supports wildcards)."""
-        if pattern == "*":
+    def _period_expired(self, key: str) -> bool:
+        if key not in self.period_start:
             return True
-        if pattern.endswith("/*"):
-            return resource.startswith(pattern[:-1])
-        return resource == pattern
 
-    def applies_to(self, context: PolicyContext) -> bool:
+        start = self.period_start[key]
+        now = datetime.utcnow()
+
+        if self.period == "request":
+            return True
+        elif self.period == "hour":
+            return (now - start).total_seconds() > 3600
+        elif self.period == "day":
+            return (now - start).days >= 1
+        elif self.period == "month":
+            return (now - start).days >= 30
+
         return True
 
 
-class ApprovalPolicy(Policy):
-    """
-    Policy requiring human approval for sensitive actions.
-    """
+# =============================================================================
+# The Policy Gateway (Section 11.6)
+# =============================================================================
 
-    def __init__(self,
-                 policy_id: str,
-                 sensitive_actions: list[str] = None,
-                 sensitive_resources: list[str] = None,
-                 approvers: list[str] = None):
-        super().__init__(policy_id, PolicyPriority.HIGH)
-        self.sensitive_actions = sensitive_actions or ["delete", "modify_permissions", "transfer"]
-        self.sensitive_resources = sensitive_resources or ["production/*", "finance/*"]
-        self.approvers = approvers or ["admin"]
-
-    async def evaluate(self, context: PolicyContext) -> PolicyResult:
-        self.stats["evaluations"] += 1
-
-        # Check if action is sensitive
-        action_sensitive = context.action in self.sensitive_actions
-
-        # Check if resource is sensitive
-        resource_sensitive = any(
-            self._match_resource(context.resource, pattern)
-            for pattern in self.sensitive_resources
-        )
-
-        if action_sensitive or resource_sensitive:
-            return PolicyResult(
-                decision=PolicyDecision.REQUIRE_APPROVAL,
-                policy_id=self.policy_id,
-                reason=f"Action requires approval: {'sensitive action' if action_sensitive else 'sensitive resource'}",
-                required_approvers=self.approvers,
-                audit_data={
-                    "action_sensitive": action_sensitive,
-                    "resource_sensitive": resource_sensitive
-                }
-            )
-
-        self.stats["approvals"] += 1
-        return PolicyResult(
-            decision=PolicyDecision.ALLOW,
-            policy_id=self.policy_id,
-            reason="No approval required"
-        )
-
-    def _match_resource(self, resource: str, pattern: str) -> bool:
-        if pattern.endswith("/*"):
-            return resource.startswith(pattern[:-1])
-        return resource == pattern
-
-    def applies_to(self, context: PolicyContext) -> bool:
-        return True
+class Verdict(Enum):
+    """Final decision after evaluating all policies"""
+    ALLOW = "allow"
+    DENY = "deny"
+    RATE_LIMITED = "rate_limited"
+    NEEDS_APPROVAL = "needs_approval"
 
 
-class AuditLogger:
-    """
-    Audit logging system for gateway operations.
-    """
-
-    def __init__(self, max_entries: int = 10000):
-        self.entries: list[AuditEntry] = []
-        self.max_entries = max_entries
-        self._lock = asyncio.Lock()
-
-    async def log(self, entry: AuditEntry):
-        """Log an audit entry."""
-        async with self._lock:
-            self.entries.append(entry)
-            if len(self.entries) > self.max_entries:
-                self.entries = self.entries[-self.max_entries:]
-
-    async def query(self,
-                    agent_id: Optional[str] = None,
-                    action: Optional[str] = None,
-                    decision: Optional[PolicyDecision] = None,
-                    start_time: Optional[float] = None,
-                    end_time: Optional[float] = None,
-                    limit: int = 100) -> list[AuditEntry]:
-        """Query audit logs."""
-        results = []
-        for entry in reversed(self.entries):
-            if agent_id and entry.agent_id != agent_id:
-                continue
-            if action and entry.action != action:
-                continue
-            if decision and entry.decision != decision:
-                continue
-            if start_time and entry.timestamp < start_time:
-                continue
-            if end_time and entry.timestamp > end_time:
-                continue
-            results.append(entry)
-            if len(results) >= limit:
-                break
-        return results
-
-    async def get_stats(self, window_seconds: int = 3600) -> dict:
-        """Get statistics for the specified time window."""
-        cutoff = time.time() - window_seconds
-        recent = [e for e in self.entries if e.timestamp >= cutoff]
-
-        return {
-            "total_requests": len(recent),
-            "decisions": {
-                d.value: sum(1 for e in recent if e.decision == d)
-                for d in PolicyDecision
-            },
-            "by_agent": defaultdict(int, {
-                e.agent_id: sum(1 for r in recent if r.agent_id == e.agent_id)
-                for e in recent
-            }),
-            "avg_latency_ms": sum(e.latency_ms for e in recent) / len(recent) if recent else 0
-        }
+@dataclass
+class PolicyDecision:
+    verdict: Verdict
+    matched_policies: list[str]
+    reasons: list[str] = field(default_factory=list)
+    metadata: dict = field(default_factory=dict)
 
 
 class PolicyGateway:
     """
-    Main gateway that enforces policies on agent requests.
+    Central policy enforcement point.
+
+    All agent requests flow through the gateway,
+    which evaluates applicable policies and makes decisions.
     """
 
     def __init__(self):
         self.policies: list[Policy] = []
-        self.audit_logger = AuditLogger()
-        self.pending_approvals: dict[str, dict] = {}  # request_id -> approval state
+        self.rate_limiters: dict[str, RateLimitPolicy] = {}
+        self.content_policy: ContentPolicy = ContentPolicy()
+        self.budget_policies: dict[str, BudgetPolicy] = {}
 
     def add_policy(self, policy: Policy):
         """Add a policy to the gateway."""
         self.policies.append(policy)
-        # Sort by priority
-        self.policies.sort(key=lambda p: p.priority.value)
+        self.policies.sort(key=lambda p: p.priority, reverse=True)
 
-    def remove_policy(self, policy_id: str):
-        """Remove a policy from the gateway."""
-        self.policies = [p for p in self.policies if p.policy_id != policy_id]
+    def add_rate_limit(self, name: str, policy: RateLimitPolicy):
+        """Add a rate limit policy."""
+        self.rate_limiters[name] = policy
 
-    async def process_request(self,
-                               context: PolicyContext,
-                               handler: Callable) -> dict:
-        """
-        Process a request through the gateway.
+    def add_budget(self, name: str, policy: BudgetPolicy):
+        """Add a budget policy."""
+        self.budget_policies[name] = policy
 
-        Args:
-            context: The policy evaluation context
-            handler: The actual handler to call if policies allow
+    def evaluate(self, request: dict) -> PolicyDecision:
+        """Evaluate a request against all policies."""
+        context = self._build_context(request)
+        matched = []
+        reasons = []
 
-        Returns:
-            Result dict with response or error
-        """
-        start_time = time.time()
-
-        # Evaluate all applicable policies
-        results = []
+        # Check general policies (highest priority first)
         for policy in self.policies:
-            if policy.enabled and policy.applies_to(context):
-                result = await policy.evaluate(context)
-                results.append(result)
+            if policy.applies(context):
+                matched.append(policy.id)
 
-                # Short-circuit on DENY
-                if result.decision == PolicyDecision.DENY:
-                    await self._log_request(context, result, start_time)
-                    return {
-                        "allowed": False,
-                        "error": result.reason,
-                        "policy": result.policy_id,
-                        "request_id": context.request_id
-                    }
+                if policy.action == PolicyAction.DENY:
+                    return PolicyDecision(
+                        verdict=Verdict.DENY,
+                        matched_policies=matched,
+                        reasons=[policy.description]
+                    )
+                elif policy.action == PolicyAction.REQUIRE_APPROVAL:
+                    return PolicyDecision(
+                        verdict=Verdict.NEEDS_APPROVAL,
+                        matched_policies=matched,
+                        reasons=[policy.description]
+                    )
 
-                # Handle approval requirement
-                if result.decision == PolicyDecision.REQUIRE_APPROVAL:
-                    approval_id = await self._create_approval_request(context, result)
-                    await self._log_request(context, result, start_time)
-                    return {
-                        "allowed": False,
-                        "pending_approval": True,
-                        "approval_id": approval_id,
-                        "required_approvers": result.required_approvers,
-                        "request_id": context.request_id
-                    }
-
-        # Apply any modifications
-        modified_payload = context.payload.copy()
-        for result in results:
-            if result.decision == PolicyDecision.MODIFY and result.modifications:
-                modified_payload = await self._apply_modifications(
-                    modified_payload, result.modifications
+        # Check rate limits
+        for name, limiter in self.rate_limiters.items():
+            allowed, info = limiter.check(context)
+            if not allowed:
+                return PolicyDecision(
+                    verdict=Verdict.RATE_LIMITED,
+                    matched_policies=[name],
+                    reasons=[info.get("reason", "Rate limit exceeded")],
+                    metadata=info
                 )
 
-        # Execute the handler
-        try:
-            if asyncio.iscoroutinefunction(handler):
-                response = await handler(modified_payload)
-            else:
-                response = handler(modified_payload)
+        # Check budgets
+        agent_id = context.get("agent_id")
+        estimated_cost = request.get("estimated_cost", 0)
 
-            # Log success
-            audit_entry = AuditEntry(
-                request_id=context.request_id,
-                agent_id=context.agent_id,
-                action=context.action,
-                resource=context.resource,
-                decision=PolicyDecision.ALLOW,
-                policy_id="gateway",
-                reason="All policies passed",
-                latency_ms=(time.time() - start_time) * 1000,
-                payload_hash=hashlib.sha256(json.dumps(context.payload).encode()).hexdigest()[:16],
-                response_hash=hashlib.sha256(json.dumps(response).encode()).hexdigest()[:16] if response else ""
+        for name, budget in self.budget_policies.items():
+            allowed, info = budget.check(agent_id, estimated_cost)
+            if not allowed:
+                return PolicyDecision(
+                    verdict=Verdict.DENY,
+                    matched_policies=[name],
+                    reasons=["Budget exceeded"],
+                    metadata=info
+                )
+
+        # Check content if present
+        if "content" in request:
+            allowed, violations = self.content_policy.check(
+                request["content"],
+                context
             )
-            await self.audit_logger.log(audit_entry)
+            if not allowed:
+                return PolicyDecision(
+                    verdict=Verdict.DENY,
+                    matched_policies=["content_policy"],
+                    reasons=violations
+                )
 
-            return {
-                "allowed": True,
-                "response": response,
-                "request_id": context.request_id,
-                "latency_ms": audit_entry.latency_ms
-            }
+        return PolicyDecision(
+            verdict=Verdict.ALLOW,
+            matched_policies=matched,
+            reasons=["All policies passed"]
+        )
 
-        except Exception as e:
-            return {
-                "allowed": True,
-                "error": str(e),
-                "request_id": context.request_id
-            }
+    def _build_context(self, request: dict) -> dict:
+        """Build evaluation context from request."""
+        return {
+            "agent_id": request.get("agent_id"),
+            "agent_role": request.get("agent_role"),
+            "action": request.get("action"),
+            "resource": request.get("resource"),
+            "type": request.get("type"),
+            "timestamp": datetime.utcnow(),
+            "request": request
+        }
 
-    async def _apply_modifications(self, payload: dict, modifications: dict) -> dict:
-        """Apply policy-required modifications to payload."""
-        result = payload.copy()
 
-        if "redact_pii" in modifications:
-            result = await self._redact_pii(result, modifications["redact_pii"])
+# =============================================================================
+# Policy Enforced Agent (Section 11.7)
+# =============================================================================
+
+class PolicyViolationError(Exception):
+    pass
+
+
+class RateLimitedError(Exception):
+    pass
+
+
+class PolicyEnforcedAgent:
+    def __init__(
+        self,
+        agent_id: str,
+        gateway: PolicyGateway,
+        llm_client: Any
+    ):
+        self.agent_id = agent_id
+        self.gateway = gateway
+        self.llm = llm_client
+
+    async def execute(self, action: str, resource: str, content: Any = None) -> Any:
+        """Execute an action through the policy gateway."""
+
+        # Build request
+        request = {
+            "agent_id": self.agent_id,
+            "action": action,
+            "resource": resource,
+            "content": content,
+            "estimated_cost": self._estimate_cost(action, content),
+            "timestamp": datetime.utcnow().isoformat()
+        }
+
+        # Evaluate policies
+        decision = self.gateway.evaluate(request)
+
+        if decision.verdict == Verdict.DENY:
+            raise PolicyViolationError(
+                f"Action denied: {', '.join(decision.reasons)}"
+            )
+
+        if decision.verdict == Verdict.RATE_LIMITED:
+            retry_after = decision.metadata.get("retry_after", 60)
+            raise RateLimitedError(
+                f"Rate limited. Retry after {retry_after}s"
+            )
+
+        if decision.verdict == Verdict.NEEDS_APPROVAL:
+            # Queue for human approval
+            return await self._request_approval(request, decision)
+
+        # Execute the action
+        result = await self._do_execute(action, resource, content)
+
+        # Record usage for budget tracking
+        actual_cost = self._calculate_actual_cost(result)
+        for budget in self.gateway.budget_policies.values():
+            budget.record(self.agent_id, actual_cost)
 
         return result
 
-    async def _redact_pii(self, payload: dict, pii_types: list[str]) -> dict:
-        """Redact PII from payload."""
-        content = json.dumps(payload)
+    def _estimate_cost(self, action: str, content: Any) -> float:
+        """Estimate cost before execution."""
+        if action == "llm_call":
+            # Estimate based on content length
+            tokens = len(str(content).split()) * 1.3
+            return tokens * 0.00003  # Example pricing
+        return 0
 
-        redaction_patterns = {
-            "ssn": (r'\b\d{3}-\d{2}-\d{4}\b', '***-**-****'),
-            "credit_card": (r'\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b', '****-****-****-****'),
-            "email": (r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', '[REDACTED_EMAIL]'),
-            "phone": (r'\b\d{3}[-.]?\d{3}[-.]?\d{4}\b', '[REDACTED_PHONE]'),
-            "api_key": (r'\b[A-Za-z0-9]{32,}\b', '[REDACTED_KEY]')
-        }
+    def _calculate_actual_cost(self, result: Any) -> float:
+        """Calculate actual cost after execution."""
+        if hasattr(result, "usage"):
+            return result.usage.total_tokens * 0.00003
+        return 0
 
-        for pii_type in pii_types:
-            if pii_type in redaction_patterns:
-                pattern, replacement = redaction_patterns[pii_type]
-                content = re.sub(pattern, replacement, content)
+    async def _do_execute(self, action: str, resource: str, content: Any) -> Any:
+        """Execute the actual action (placeholder)."""
+        # In a real implementation, this would dispatch to actual handlers
+        return {"status": "success", "action": action, "resource": resource}
 
-        return json.loads(content)
+    async def _request_approval(self, request: dict, decision: PolicyDecision) -> Any:
+        """Request human approval (placeholder)."""
+        return {"status": "pending_approval", "request": request}
 
-    async def _create_approval_request(self, context: PolicyContext,
-                                        result: PolicyResult) -> str:
-        """Create a pending approval request."""
-        approval_id = f"approval-{context.request_id}"
-        self.pending_approvals[approval_id] = {
-            "context": context,
-            "result": result,
-            "created_at": time.time(),
-            "status": "pending",
-            "approvals": [],
-            "rejections": []
-        }
-        return approval_id
 
-    async def approve(self, approval_id: str, approver: str,
-                      handler: Callable) -> dict:
-        """Approve a pending request."""
-        if approval_id not in self.pending_approvals:
-            return {"error": "Approval request not found"}
+# =============================================================================
+# Human-in-the-Loop Approval Workflows (Section 11.9)
+# =============================================================================
 
-        approval = self.pending_approvals[approval_id]
-        result = approval["result"]
+class ApprovalStatus(Enum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    DENIED = "denied"
+    EXPIRED = "expired"
 
-        if approver not in result.required_approvers:
-            return {"error": f"Approver {approver} not authorized"}
 
-        approval["approvals"].append({
-            "approver": approver,
-            "timestamp": time.time()
-        })
+@dataclass
+class ApprovalRequest:
+    id: str
+    agent_id: str
+    action: str
+    resource: str
+    content: Any
+    reason: str  # Why approval is needed
+    policy_id: str
+    status: ApprovalStatus = ApprovalStatus.PENDING
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    expires_at: datetime = None
+    decided_by: str = None
+    decided_at: datetime = None
+    decision_reason: str = None
 
-        # Check if enough approvals
-        if len(approval["approvals"]) >= 1:  # Can adjust threshold
-            approval["status"] = "approved"
-            # Execute the original request
-            context = approval["context"]
-            return await self.process_request(context, handler)
 
-        return {"status": "pending", "approvals": len(approval["approvals"])}
+class ApprovalWorkflow:
+    """Manages human approval for agent actions."""
 
-    async def reject(self, approval_id: str, rejector: str, reason: str) -> dict:
-        """Reject a pending approval request."""
-        if approval_id not in self.pending_approvals:
-            return {"error": "Approval request not found"}
+    def __init__(self, default_timeout_hours: int = 24):
+        self.pending: dict[str, ApprovalRequest] = {}
+        self.default_timeout = default_timeout_hours
+        self.notification_handlers: list[Callable] = []
 
-        approval = self.pending_approvals[approval_id]
-        approval["status"] = "rejected"
-        approval["rejections"].append({
-            "rejector": rejector,
-            "reason": reason,
-            "timestamp": time.time()
-        })
+    async def request_approval(
+        self,
+        agent_id: str,
+        action: str,
+        resource: str,
+        content: Any,
+        reason: str,
+        policy_id: str,
+        timeout_hours: int = None
+    ) -> ApprovalRequest:
+        """Create an approval request and notify approvers."""
 
-        return {"status": "rejected", "reason": reason}
+        request_id = f"approval_{token_urlsafe(8)}"
+        timeout = timeout_hours or self.default_timeout
 
-    async def _log_request(self, context: PolicyContext,
-                           result: PolicyResult, start_time: float):
-        """Log a denied or pending request."""
-        entry = AuditEntry(
-            request_id=context.request_id,
-            agent_id=context.agent_id,
-            action=context.action,
-            resource=context.resource,
-            decision=result.decision,
-            policy_id=result.policy_id,
-            reason=result.reason,
-            latency_ms=(time.time() - start_time) * 1000,
-            payload_hash=hashlib.sha256(json.dumps(context.payload).encode()).hexdigest()[:16]
+        request = ApprovalRequest(
+            id=request_id,
+            agent_id=agent_id,
+            action=action,
+            resource=resource,
+            content=content,
+            reason=reason,
+            policy_id=policy_id,
+            expires_at=datetime.utcnow() + timedelta(hours=timeout)
         )
-        await self.audit_logger.log(entry)
 
-    def get_policy_stats(self) -> dict:
-        """Get statistics for all policies."""
-        return {
-            policy.policy_id: policy.stats
-            for policy in self.policies
+        self.pending[request_id] = request
+
+        # Notify approvers
+        for handler in self.notification_handlers:
+            await handler(request)
+
+        return request
+
+    async def wait_for_decision(
+        self,
+        request_id: str,
+        poll_interval: int = 5
+    ) -> ApprovalRequest:
+        """Wait for a decision on an approval request."""
+
+        while True:
+            request = self.pending.get(request_id)
+            if not request:
+                raise ValueError(f"Unknown request: {request_id}")
+
+            # Check expiration
+            if datetime.utcnow() > request.expires_at:
+                request.status = ApprovalStatus.EXPIRED
+                return request
+
+            # Check if decided
+            if request.status != ApprovalStatus.PENDING:
+                return request
+
+            await asyncio.sleep(poll_interval)
+
+    def approve(self, request_id: str, approver: str, reason: str = None):
+        """Approve a pending request."""
+        request = self.pending.get(request_id)
+        if request and request.status == ApprovalStatus.PENDING:
+            request.status = ApprovalStatus.APPROVED
+            request.decided_by = approver
+            request.decided_at = datetime.utcnow()
+            request.decision_reason = reason
+
+    def deny(self, request_id: str, approver: str, reason: str):
+        """Deny a pending request."""
+        request = self.pending.get(request_id)
+        if request and request.status == ApprovalStatus.PENDING:
+            request.status = ApprovalStatus.DENIED
+            request.decided_by = approver
+            request.decided_at = datetime.utcnow()
+            request.decision_reason = reason
+
+
+# =============================================================================
+# Tiered Approval Thresholds (Section 11.9.1)
+# =============================================================================
+
+class ApprovalTier(Enum):
+    AUTO = 0        # No approval needed
+    MANAGER = 1     # Single manager approval
+    DIRECTOR = 2    # Director-level approval
+    EXECUTIVE = 3   # Executive approval
+
+
+@dataclass
+class TieredApprovalPolicy:
+    """Policy that requires different approval levels."""
+
+    thresholds: dict[str, list[tuple[float, ApprovalTier]]]
+
+    def get_required_tier(self, action: str, amount: float) -> ApprovalTier:
+        """Determine required approval tier."""
+
+        if action not in self.thresholds:
+            return ApprovalTier.AUTO
+
+        for threshold, tier in sorted(self.thresholds[action], reverse=True):
+            if amount >= threshold:
+                return tier
+
+        return ApprovalTier.AUTO
+
+
+# =============================================================================
+# Policy Testing and Simulation (Section 11.10)
+# =============================================================================
+
+@dataclass
+class SimulationReport:
+    total_requests: int
+    results: dict
+    policy_hit_rate: dict[str, float]
+
+
+@dataclass
+class PolicyDiff:
+    total_tested: int
+    behavioral_changes: int
+    changes: list[dict]
+
+
+class PolicySimulator:
+    """Test policy configurations without affecting production."""
+
+    def __init__(self, gateway: PolicyGateway):
+        self.gateway = gateway
+        self.simulation_log: list[dict] = []
+
+    def simulate(self, requests: list[dict]) -> SimulationReport:
+        """Simulate a batch of requests against current policies."""
+
+        results = {
+            "allowed": 0,
+            "denied": 0,
+            "rate_limited": 0,
+            "needs_approval": 0
         }
 
+        for request in requests:
+            decision = self.gateway.evaluate(request)
+
+            self.simulation_log.append({
+                "request": request,
+                "decision": decision.verdict.value,
+                "matched_policies": decision.matched_policies
+            })
+
+            results[decision.verdict.value] += 1
+
+        return SimulationReport(
+            total_requests=len(requests),
+            results=results,
+            policy_hit_rate=self._calculate_hit_rates()
+        )
+
+    def _calculate_hit_rates(self) -> dict[str, float]:
+        """Calculate how often each policy matched."""
+        hits = defaultdict(int)
+
+        for entry in self.simulation_log:
+            for policy_id in entry["matched_policies"]:
+                hits[policy_id] += 1
+
+        total = len(self.simulation_log)
+        return {k: v/total for k, v in hits.items()}
+
+    def diff_policies(
+        self,
+        current_gateway: PolicyGateway,
+        proposed_gateway: PolicyGateway,
+        test_requests: list[dict]
+    ) -> PolicyDiff:
+        """Compare behavior of two policy configurations."""
+
+        changes = []
+
+        for request in test_requests:
+            current_decision = current_gateway.evaluate(request)
+            proposed_decision = proposed_gateway.evaluate(request)
+
+            if current_decision.verdict != proposed_decision.verdict:
+                changes.append({
+                    "request": request,
+                    "current": current_decision.verdict.value,
+                    "proposed": proposed_decision.verdict.value
+                })
+
+        return PolicyDiff(
+            total_tested=len(test_requests),
+            behavioral_changes=len(changes),
+            changes=changes
+        )
+
 
 # =============================================================================
-# Example Usage
+# Policy Observability (Section 11.11)
 # =============================================================================
 
-async def example_handler(payload: dict) -> dict:
-    """Example request handler."""
-    await asyncio.sleep(0.05)  # Simulate processing
-    return {
-        "status": "success",
-        "processed": payload.get("data", "unknown")
-    }
+class PolicyObserver:
+    """Collects metrics and traces for policy enforcement."""
 
+    def __init__(self, metrics_client, trace_client):
+        self.metrics = metrics_client
+        self.tracer = trace_client
+
+    def observe_decision(
+        self,
+        request: dict,
+        decision: PolicyDecision,
+        duration_ms: float
+    ):
+        """Record metrics for a policy decision."""
+
+        # Count decisions by verdict
+        self.metrics.increment(
+            "policy.decisions.total",
+            tags={
+                "verdict": decision.verdict.value,
+                "agent_id": request.get("agent_id", "unknown")
+            }
+        )
+
+        # Record latency
+        self.metrics.histogram(
+            "policy.evaluation.duration_ms",
+            duration_ms
+        )
+
+        # Record policy matches
+        for policy_id in decision.matched_policies:
+            self.metrics.increment(
+                "policy.matches",
+                tags={"policy_id": policy_id}
+            )
+
+    def create_trace(self, request: dict):
+        """Create a trace span for policy evaluation."""
+        return self.tracer.start_span(
+            "policy.evaluate",
+            attributes={
+                "agent_id": request.get("agent_id"),
+                "action": request.get("action"),
+                "resource": request.get("resource")
+            }
+        )
+
+
+# =============================================================================
+# Common Policy Patterns (Section 11.12)
+# =============================================================================
+
+class EscalatingPolicy:
+    """Policy that gets stricter after violations."""
+
+    def __init__(
+        self,
+        base_limit: int,
+        violation_penalty: float = 0.5,
+        recovery_rate: float = 0.1
+    ):
+        self.base_limit = base_limit
+        self.penalty = violation_penalty
+        self.recovery = recovery_rate
+        self.agent_limits: dict[str, float] = {}
+
+    def get_limit(self, agent_id: str) -> int:
+        """Get current limit for agent."""
+        multiplier = self.agent_limits.get(agent_id, 1.0)
+        return int(self.base_limit * multiplier)
+
+    def record_violation(self, agent_id: str):
+        """Reduce limit after violation."""
+        current = self.agent_limits.get(agent_id, 1.0)
+        self.agent_limits[agent_id] = max(0.1, current * self.penalty)
+
+    def record_success(self, agent_id: str):
+        """Slowly restore limit after successful behavior."""
+        current = self.agent_limits.get(agent_id, 1.0)
+        self.agent_limits[agent_id] = min(1.0, current + self.recovery)
+
+
+@dataclass
+class PolicyModifier:
+    name: str
+    condition: Callable[[dict], bool]
+    modification: Callable[[Policy], Policy]
+
+    def applies(self, context: dict) -> bool:
+        return self.condition(context)
+
+    def modify(self, policy: Policy) -> Policy:
+        return self.modification(policy)
+
+
+class ContextSensitivePolicy:
+    """Policy that adjusts based on context."""
+
+    def __init__(self, base_policy: Policy):
+        self.base = base_policy
+        self.modifiers: list[PolicyModifier] = []
+
+    def evaluate(self, request: dict, context: dict) -> PolicyDecision:
+        """Evaluate with context modifications."""
+
+        modified_policy = self.base
+
+        for modifier in self.modifiers:
+            if modifier.applies(context):
+                modified_policy = modifier.modify(modified_policy)
+
+        # Build a simple decision based on policy evaluation
+        if modified_policy.applies(context):
+            if modified_policy.action == PolicyAction.DENY:
+                return PolicyDecision(
+                    verdict=Verdict.DENY,
+                    matched_policies=[modified_policy.id],
+                    reasons=[modified_policy.description]
+                )
+            elif modified_policy.action == PolicyAction.REQUIRE_APPROVAL:
+                return PolicyDecision(
+                    verdict=Verdict.NEEDS_APPROVAL,
+                    matched_policies=[modified_policy.id],
+                    reasons=[modified_policy.description]
+                )
+
+        return PolicyDecision(
+            verdict=Verdict.ALLOW,
+            matched_policies=[modified_policy.id],
+            reasons=["Policy passed"]
+        )
+
+    def add_modifier(self, modifier: "PolicyModifier"):
+        self.modifiers.append(modifier)
+
+
+# =============================================================================
+# Example Usage (Section 11.8)
+# =============================================================================
 
 async def main():
-    """Demonstration of policy gateway."""
+    # Create gateway
+    gateway = PolicyGateway()
+
+    # Add general policies
+    gateway.add_policy(Policy(
+        id="block_external_pii",
+        name="Block PII in External Calls",
+        description="Prevent PII from being sent to external services",
+        conditions=[
+            PolicyCondition("type", "equals", "external_api")
+        ],
+        action=PolicyAction.LOG,  # Will combine with content policy
+        priority=100
+    ))
+
+    gateway.add_policy(Policy(
+        id="require_approval_high_value",
+        name="Require Approval for High-Value Actions",
+        description="Actions over $100 need human approval",
+        conditions=[
+            PolicyCondition("estimated_cost", "greater_than", 100)
+        ],
+        action=PolicyAction.REQUIRE_APPROVAL,
+        priority=90
+    ))
+
+    # Add rate limits
+    gateway.add_rate_limit(
+        "api_calls",
+        RateLimitPolicy(max_requests=100, window_seconds=60, scope="per_agent")
+    )
+
+    gateway.add_rate_limit(
+        "expensive_ops",
+        RateLimitPolicy(max_requests=10, window_seconds=3600, scope="per_agent")
+    )
+
+    # Add budget
+    gateway.add_budget(
+        "daily_spend",
+        BudgetPolicy(max_amount=500, period="day", resource="dollars")
+    )
+
+    # Add content rules
+    gateway.content_policy.add_rule(ContentRule(
+        name="ssn",
+        pattern=r"\b\d{3}-\d{2}-\d{4}\b",
+        action="block",
+        violation_message="SSN detected in content"
+    ))
+
+    # Example: Block PII in external requests
+    content_policy = ContentPolicy()
+    content_policy.add_rule(ContentRule(
+        name="ssn",
+        pattern=r"\b\d{3}-\d{2}-\d{4}\b",
+        action="block",
+        violation_message="Social Security Number detected",
+        contexts=["external_api"]
+    ))
+    content_policy.add_rule(ContentRule(
+        name="email",
+        pattern=r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b",
+        action="redact",
+        violation_message="Email address detected"
+    ))
+    content_policy.add_rule(ContentRule(
+        name="credit_card",
+        pattern=r"\b\d{4}[- ]?\d{4}[- ]?\d{4}[- ]?\d{4}\b",
+        action="block",
+        violation_message="Credit card number detected"
+    ))
+
+    # Example: 100 requests per minute per agent
+    rate_policy = RateLimitPolicy(
+        max_requests=100,
+        window_seconds=60,
+        scope="per_agent"
+    )
+
+    # Example: $100/day per agent
+    budget_policy = BudgetPolicy(
+        max_amount=100.0,
+        period="day",
+        resource="dollars"
+    )
+
+    # Example: Spending approval tiers
+    spending_policy = TieredApprovalPolicy(
+        thresholds={
+            "purchase": [
+                (0, ApprovalTier.AUTO),      # Under $100 - auto-approve
+                (100, ApprovalTier.MANAGER),  # $100-$1000 - manager
+                (1000, ApprovalTier.DIRECTOR), # $1000-$10000 - director
+                (10000, ApprovalTier.EXECUTIVE) # Over $10000 - executive
+            ],
+            "data_export": [
+                (0, ApprovalTier.MANAGER),    # Any data export needs manager
+                (1000, ApprovalTier.DIRECTOR)  # Over 1000 records - director
+            ]
+        }
+    )
+
+    # Create a mock LLM client for testing
+    class MockLLM:
+        pass
+
+    llm = MockLLM()
+
+    # Create agent with policy enforcement
+    agent = PolicyEnforcedAgent(
+        agent_id="agent_123",
+        gateway=gateway,
+        llm_client=llm
+    )
+
+    # Test various requests
     print("=" * 60)
     print("Policy Gateway Demonstration")
     print("=" * 60)
 
-    # Create gateway
-    gateway = PolicyGateway()
+    try:
+        # Normal request - should pass
+        print("\nTest 1: Normal read request")
+        result = await agent.execute("read", "documents/report.pdf")
+        print(f"  Result: {result}")
 
-    # Add policies
-    gateway.add_policy(RateLimitPolicy(
-        policy_id="rate-limit",
-        requests_per_minute=10,
-        burst_size=5
-    ))
-
-    gateway.add_policy(QuotaPolicy(
-        policy_id="quota",
-        daily_limit=100,
-        monthly_limit=2000
-    ))
-
-    gateway.add_policy(ContentPolicy(
-        policy_id="content-filter",
-        blocked_patterns=[r"password\s*=\s*\S+", r"secret"],
-        pii_detection=True
-    ))
-
-    access_policy = AccessControlPolicy(
-        policy_id="access-control",
-        permissions={
-            "admin": {"*": ["*"]},
-            "analyst": {"data/*": ["read", "analyze"], "reports/*": ["read", "write"]},
-            "default": {"public/*": ["read"]}
-        }
-    )
-    access_policy.assign_role("agent-admin", ["admin"])
-    access_policy.assign_role("agent-analyst", ["analyst"])
-    access_policy.assign_role("agent-guest", ["default"])
-    gateway.add_policy(access_policy)
-
-    gateway.add_policy(ApprovalPolicy(
-        policy_id="approval",
-        sensitive_actions=["delete"],
-        sensitive_resources=["production/*"],
-        approvers=["admin"]
-    ))
-
-    print(f"\nGateway configured with {len(gateway.policies)} policies")
-    print()
-
-    # Test cases
-    test_cases = [
-        {
-            "name": "Normal request",
-            "context": PolicyContext(
-                agent_id="agent-analyst",
-                action="read",
-                resource="data/reports",
-                payload={"query": "monthly stats"}
-            )
-        },
-        {
-            "name": "Request with PII",
-            "context": PolicyContext(
-                agent_id="agent-analyst",
-                action="analyze",
-                resource="data/customers",
-                payload={"email": "user@example.com", "ssn": "123-45-6789"}
-            )
-        },
-        {
-            "name": "Unauthorized access",
-            "context": PolicyContext(
-                agent_id="agent-guest",
-                action="write",
-                resource="data/reports",
-                payload={"data": "test"}
-            )
-        },
-        {
-            "name": "Sensitive action requiring approval",
-            "context": PolicyContext(
-                agent_id="agent-admin",
-                action="delete",
-                resource="production/database",
-                payload={"table": "users"}
-            )
-        },
-        {
-            "name": "Blocked content",
-            "context": PolicyContext(
-                agent_id="agent-admin",
-                action="write",
-                resource="config/settings",
-                payload={"data": "password = mysecretpass123"}
-            )
-        }
-    ]
-
-    for test in test_cases:
-        print(f"Test: {test['name']}")
-        result = await gateway.process_request(test["context"], example_handler)
-        print(f"  Allowed: {result.get('allowed', False)}")
-        if result.get('error'):
-            print(f"  Error: {result['error']}")
-        if result.get('pending_approval'):
-            print(f"  Pending approval: {result['approval_id']}")
-        if result.get('response'):
-            print(f"  Response: {result['response']}")
-        print()
-
-    # Rate limit test
-    print("Rate limit test (rapid requests):")
-    for i in range(8):
-        context = PolicyContext(
-            agent_id="agent-analyst",
-            action="read",
-            resource="data/stats",
-            payload={"query": f"test {i}"}
+        # Request with PII - should be blocked
+        print("\nTest 2: Request with PII (should be blocked)")
+        await agent.execute(
+            "external_api_call",
+            "https://api.example.com",
+            content="Customer SSN: 123-45-6789"
         )
-        result = await gateway.process_request(context, example_handler)
-        status = "allowed" if result.get("allowed") else "denied"
-        print(f"  Request {i+1}: {status}")
+    except PolicyViolationError as e:
+        print(f"  Blocked: {e}")
+    except RateLimitedError as e:
+        print(f"  Rate limited: {e}")
 
-    print()
+    # Test rate limiting
+    print("\nTest 3: Rate limit test")
+    context = {"agent_id": "test_agent"}
+    for i in range(5):
+        allowed, info = rate_policy.check(context)
+        print(f"  Request {i+1}: {'allowed' if allowed else 'denied'} - {info}")
 
-    # Show statistics
-    print("=" * 60)
-    print("Policy Statistics")
-    print("=" * 60)
-    stats = gateway.get_policy_stats()
-    for policy_id, policy_stats in stats.items():
-        print(f"\n{policy_id}:")
-        print(f"  Evaluations: {policy_stats['evaluations']}")
-        print(f"  Approvals: {policy_stats['approvals']}")
-        print(f"  Denials: {policy_stats['denials']}")
+    # Test budget policy
+    print("\nTest 4: Budget policy test")
+    allowed, info = budget_policy.check("agent_123", 50.0)
+    print(f"  $50 request: {'allowed' if allowed else 'denied'} - {info}")
+    budget_policy.record("agent_123", 50.0)
 
-    # Audit log
+    allowed, info = budget_policy.check("agent_123", 60.0)
+    print(f"  $60 request: {'allowed' if allowed else 'denied'} - {info}")
+
+    # Test approval tiers
+    print("\nTest 5: Approval tier test")
+    tier = spending_policy.get_required_tier("purchase", 50)
+    print(f"  $50 purchase requires: {tier.name}")
+    tier = spending_policy.get_required_tier("purchase", 500)
+    print(f"  $500 purchase requires: {tier.name}")
+    tier = spending_policy.get_required_tier("purchase", 5000)
+    print(f"  $5000 purchase requires: {tier.name}")
+
     print("\n" + "=" * 60)
-    print("Recent Audit Entries")
+    print("Demonstration complete")
     print("=" * 60)
-    audit_stats = await gateway.audit_logger.get_stats(window_seconds=3600)
-    print(f"\nTotal requests: {audit_stats['total_requests']}")
-    print(f"Decisions: {audit_stats['decisions']}")
 
 
 if __name__ == "__main__":

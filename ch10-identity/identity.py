@@ -1,853 +1,1045 @@
 """
-Chapter 10: Agent Identity Systems
-===================================
-Implementation of per-agent identity management for enterprise deployments.
+Chapter 10: Agent Identity Fundamentals
+Identity Service Implementation
+================================
+
+A complete identity service for multi-agent systems.
 
 This module provides:
-1. Unique cryptographic identities for each agent
-2. Credential lifecycle management
-3. Permission-based access control
-4. Audit trail for identity operations
-
-Reference: Google Cloud Agent Identity - "assigns every agent a unique
-cryptographic ID for complete traceability and auditing"
+1. AgentIdentity and role-based identity management
+2. JWT token issuance and verification
+3. Token lifecycle: issuance, validation, refresh, revocation
+4. Scope-based authorization
+5. Audit logging
+6. Hierarchical identity and delegation patterns
+7. Security best practices
 """
 
 import asyncio
-import json
-import secrets
 import hashlib
-from datetime import datetime, timedelta, timezone
-from typing import Any
-from dataclasses import dataclass, field
-from enum import Enum
-import uuid
 import jwt
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import rsa, padding
-from cryptography.hazmat.backends import default_backend
+import logging
+import aiohttp
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from enum import Enum
+from secrets import token_urlsafe
+from typing import Any
+import json
+
+# Configure structured logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("identity")
 
 
 # =============================================================================
-# Identity Types and Permissions
+# Simple Token Authentication (Section: Simple Tokens)
 # =============================================================================
-
-class PermissionScope(str, Enum):
-    """Standard permission scopes for agents"""
-    READ_DATA = "data:read"
-    WRITE_DATA = "data:write"
-    EXECUTE_CODE = "code:execute"
-    INVOKE_TOOLS = "tools:invoke"
-    INVOKE_AGENTS = "agents:invoke"
-    MANAGE_SESSIONS = "sessions:manage"
-    ACCESS_SECRETS = "secrets:access"
-    ADMIN = "admin:*"
-
-
-class IdentityStatus(str, Enum):
-    """Status of an agent identity"""
-    ACTIVE = "active"
-    SUSPENDED = "suspended"
-    REVOKED = "revoked"
-    EXPIRED = "expired"
-
 
 @dataclass
-class AgentIdentity:
-    """
-    Unique identity for an agent.
-
-    Each agent gets a cryptographically verifiable identity that:
-    - Is globally unique
-    - Has defined permissions
-    - Has a lifecycle (creation, rotation, revocation)
-    - Supports full audit trail
-    """
+class AgentToken:
     agent_id: str
-    name: str
-    owner: str
-    permissions: list[PermissionScope]
-    public_key_pem: str
-    status: IdentityStatus
-    created_at: str
-    expires_at: str
-    metadata: dict = field(default_factory=dict)
-    last_used: str | None = None
-    revoked_at: str | None = None
-    revocation_reason: str | None = None
+    token: str
+    created_at: datetime
+    expires_at: datetime | None = None
 
-    def to_dict(self) -> dict:
-        return {
-            "agent_id": self.agent_id,
-            "name": self.name,
-            "owner": self.owner,
-            "permissions": [p.value for p in self.permissions],
-            "public_key_pem": self.public_key_pem,
-            "status": self.status.value,
-            "created_at": self.created_at,
-            "expires_at": self.expires_at,
-            "metadata": self.metadata,
-            "last_used": self.last_used,
-            "revoked_at": self.revoked_at,
-            "revocation_reason": self.revocation_reason
-        }
-
-    def has_permission(self, scope: PermissionScope) -> bool:
-        """Check if identity has a specific permission"""
-        if PermissionScope.ADMIN in self.permissions:
-            return True
-        return scope in self.permissions
-
-    def is_valid(self) -> bool:
-        """Check if identity is currently valid"""
-        if self.status != IdentityStatus.ACTIVE:
-            return False
-        # Handle 'Z' suffix for Python <3.11 compatibility
-        expires_str = self.expires_at.replace('Z', '+00:00')
-        if datetime.fromisoformat(expires_str) < datetime.now(timezone.utc):
-            return False
-        return True
-
-
-@dataclass
-class Credential:
-    """Credential issued to an agent for authentication"""
-    credential_id: str
-    agent_id: str
-    token_hash: str  # Hash of the actual token
-    issued_at: str
-    expires_at: str
-    scopes: list[str]
-    is_revoked: bool = False
-
-    def to_dict(self) -> dict:
-        return {
-            "credential_id": self.credential_id,
-            "agent_id": self.agent_id,
-            "issued_at": self.issued_at,
-            "expires_at": self.expires_at,
-            "scopes": self.scopes,
-            "is_revoked": self.is_revoked
-        }
-
-
-@dataclass
-class AuditEvent:
-    """Audit event for identity operations"""
-    event_id: str
-    event_type: str
-    agent_id: str
-    actor: str
-    timestamp: str
-    details: dict
-    ip_address: str | None = None
-
-    def to_dict(self) -> dict:
-        return {
-            "event_id": self.event_id,
-            "event_type": self.event_type,
-            "agent_id": self.agent_id,
-            "actor": self.actor,
-            "timestamp": self.timestamp,
-            "details": self.details,
-            "ip_address": self.ip_address
-        }
-
-
-# =============================================================================
-# Storage Interfaces
-# =============================================================================
-
-class IdentityStore:
-    """In-memory identity store (replace with database in production)"""
-
+class SimpleTokenAuth:
     def __init__(self):
-        self._identities: dict[str, AgentIdentity] = {}
-        self._credentials: dict[str, Credential] = {}
-        self._audit_log: list[AuditEvent] = []
+        self.tokens: dict[str, AgentToken] = {}
 
-    async def store_identity(self, identity: AgentIdentity):
-        self._identities[identity.agent_id] = identity
+    def create_token(self, agent_id: str, ttl_hours: int = 24) -> str:
+        """Create a new token for an agent."""
+        token = token_urlsafe(32)
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
 
-    async def get_identity(self, agent_id: str) -> AgentIdentity | None:
-        return self._identities.get(agent_id)
-
-    async def update_identity(self, identity: AgentIdentity):
-        self._identities[identity.agent_id] = identity
-
-    async def list_identities(
-        self,
-        owner: str | None = None,
-        status: IdentityStatus | None = None
-    ) -> list[AgentIdentity]:
-        results = list(self._identities.values())
-        if owner:
-            results = [i for i in results if i.owner == owner]
-        if status:
-            results = [i for i in results if i.status == status]
-        return results
-
-    async def store_credential(self, credential: Credential):
-        self._credentials[credential.credential_id] = credential
-
-    async def get_credential(self, credential_id: str) -> Credential | None:
-        return self._credentials.get(credential_id)
-
-    async def get_credentials_for_agent(self, agent_id: str) -> list[Credential]:
-        return [c for c in self._credentials.values() if c.agent_id == agent_id]
-
-    async def log_audit_event(self, event: AuditEvent):
-        self._audit_log.append(event)
-
-    async def get_audit_log(
-        self,
-        agent_id: str | None = None,
-        since: datetime | None = None
-    ) -> list[AuditEvent]:
-        events = self._audit_log
-        if agent_id:
-            events = [e for e in events if e.agent_id == agent_id]
-        if since:
-            since_str = since.isoformat()
-            events = [e for e in events if e.timestamp >= since_str]
-        return events
-
-
-class KeyVault:
-    """Secure key storage (replace with HSM/KMS in production)"""
-
-    def __init__(self):
-        self._keys: dict[str, bytes] = {}
-
-    async def store_private_key(
-        self,
-        key_id: str,
-        private_key: rsa.RSAPrivateKey,
-        metadata: dict
-    ):
-        # Serialize and store (in production, use proper encryption)
-        pem = private_key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=serialization.NoEncryption()
+        self.tokens[token_hash] = AgentToken(
+            agent_id=agent_id,
+            token=token_hash,
+            created_at=datetime.utcnow(),
+            expires_at=datetime.utcnow() + timedelta(hours=ttl_hours)
         )
-        self._keys[key_id] = pem
 
-    async def get_private_key(self, key_id: str) -> rsa.RSAPrivateKey | None:
-        pem = self._keys.get(key_id)
-        if not pem:
+        return token  # Return unhashed token to agent
+
+    def authenticate(self, token: str) -> str | None:
+        """Authenticate a token and return agent_id if valid."""
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+
+        agent_token = self.tokens.get(token_hash)
+        if not agent_token:
             return None
-        return serialization.load_pem_private_key(pem, password=None)
 
-    async def delete_key(self, key_id: str):
-        if key_id in self._keys:
-            del self._keys[key_id]
+        if agent_token.expires_at and agent_token.expires_at < datetime.utcnow():
+            return None
+
+        return agent_token.agent_id
+
+    def revoke(self, agent_id: str):
+        """Revoke all tokens for an agent."""
+        self.tokens = {
+            k: v for k, v in self.tokens.items()
+            if v.agent_id != agent_id
+        }
 
 
 # =============================================================================
-# Identity Service
+# Scoped Token Authentication (Section: API Keys with Scopes)
 # =============================================================================
 
-class AgentIdentityService:
-    """
-    Service for managing agent identities.
+@dataclass
+class ScopedToken:
+    agent_id: str
+    token_hash: str
+    scopes: set[str]  # e.g., {"read:customers", "write:orders"}
+    created_at: datetime
+    expires_at: datetime | None
 
-    Provides:
-    1. Identity provisioning with unique credentials
-    2. Token issuance and validation
-    3. Credential rotation
-    4. Revocation without affecting other agents
-    5. Full audit trail
-    """
+class ScopedAuth:
+    def __init__(self):
+        self.tokens: dict[str, ScopedToken] = {}
 
-    def __init__(
-        self,
-        store: IdentityStore,
-        key_vault: KeyVault,
-        jwt_secret: str,
-        default_ttl_days: int = 90
-    ):
-        self.store = store
-        self.key_vault = key_vault
-        self.jwt_secret = jwt_secret
-        self.default_ttl_days = default_ttl_days
+    def create_token(self, agent_id: str, scopes: set[str]) -> str:
+        token = token_urlsafe(32)
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
 
-    # -------------------------------------------------------------------------
-    # Identity Lifecycle
-    # -------------------------------------------------------------------------
-
-    async def provision_identity(
-        self,
-        name: str,
-        owner: str,
-        permissions: list[PermissionScope],
-        ttl_days: int | None = None,
-        metadata: dict | None = None,
-        actor: str = "system"
-    ) -> tuple[AgentIdentity, str]:
-        """
-        Provision a new agent identity.
-
-        Returns:
-            Tuple of (AgentIdentity, initial_token)
-        """
-        # Generate unique agent ID
-        agent_id = f"agent_{uuid.uuid4().hex[:12]}"
-
-        # Generate RSA key pair
-        private_key = rsa.generate_private_key(
-            public_exponent=65537,
-            key_size=2048,
-            backend=default_backend()
-        )
-        public_key = private_key.public_key()
-
-        # Serialize public key
-        public_key_pem = public_key.public_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo
-        ).decode('utf-8')
-
-        # Store private key in vault
-        await self.key_vault.store_private_key(
-            key_id=f"{agent_id}/private_key",
-            private_key=private_key,
-            metadata={"owner": owner, "name": name}
-        )
-
-        # Calculate expiration
-        ttl = ttl_days or self.default_ttl_days
-        now = datetime.now(timezone.utc)
-        expires_at = now + timedelta(days=ttl)
-
-        # Create identity
-        identity = AgentIdentity(
+        self.tokens[token_hash] = ScopedToken(
             agent_id=agent_id,
-            name=name,
-            owner=owner,
-            permissions=permissions,
-            public_key_pem=public_key_pem,
-            status=IdentityStatus.ACTIVE,
-            created_at=now.isoformat(),
-            expires_at=expires_at.isoformat(),
-            metadata=metadata or {}
-        )
-
-        # Store identity
-        await self.store.store_identity(identity)
-
-        # Issue initial token
-        token, _ = await self._issue_token(identity, actor)
-
-        # Audit log
-        await self._audit(
-            event_type="identity_provisioned",
-            agent_id=agent_id,
-            actor=actor,
-            details={
-                "name": name,
-                "owner": owner,
-                "permissions": [p.value for p in permissions],
-                "expires_at": expires_at.isoformat()
-            }
-        )
-
-        return identity, token
-
-    async def get_identity(self, agent_id: str) -> AgentIdentity | None:
-        """Get an agent's identity"""
-        return await self.store.get_identity(agent_id)
-
-    async def suspend_identity(
-        self,
-        agent_id: str,
-        reason: str,
-        actor: str
-    ) -> AgentIdentity:
-        """Temporarily suspend an agent identity"""
-        identity = await self.store.get_identity(agent_id)
-        if not identity:
-            raise ValueError(f"Identity not found: {agent_id}")
-
-        identity.status = IdentityStatus.SUSPENDED
-        await self.store.update_identity(identity)
-
-        # Revoke all active credentials
-        credentials = await self.store.get_credentials_for_agent(agent_id)
-        for cred in credentials:
-            cred.is_revoked = True
-            await self.store.store_credential(cred)
-
-        await self._audit(
-            event_type="identity_suspended",
-            agent_id=agent_id,
-            actor=actor,
-            details={"reason": reason}
-        )
-
-        return identity
-
-    async def revoke_identity(
-        self,
-        agent_id: str,
-        reason: str,
-        actor: str
-    ) -> AgentIdentity:
-        """
-        Permanently revoke an agent identity.
-
-        This is irreversible - the agent will need a new identity.
-        """
-        identity = await self.store.get_identity(agent_id)
-        if not identity:
-            raise ValueError(f"Identity not found: {agent_id}")
-
-        identity.status = IdentityStatus.REVOKED
-        identity.revoked_at = datetime.now(timezone.utc).isoformat()
-        identity.revocation_reason = reason
-        await self.store.update_identity(identity)
-
-        # Revoke all credentials
-        credentials = await self.store.get_credentials_for_agent(agent_id)
-        for cred in credentials:
-            cred.is_revoked = True
-            await self.store.store_credential(cred)
-
-        # Delete private key
-        await self.key_vault.delete_key(f"{agent_id}/private_key")
-
-        await self._audit(
-            event_type="identity_revoked",
-            agent_id=agent_id,
-            actor=actor,
-            details={"reason": reason}
-        )
-
-        return identity
-
-    async def reactivate_identity(
-        self,
-        agent_id: str,
-        actor: str
-    ) -> AgentIdentity:
-        """Reactivate a suspended identity"""
-        identity = await self.store.get_identity(agent_id)
-        if not identity:
-            raise ValueError(f"Identity not found: {agent_id}")
-
-        if identity.status == IdentityStatus.REVOKED:
-            raise ValueError("Cannot reactivate revoked identity")
-
-        identity.status = IdentityStatus.ACTIVE
-        await self.store.update_identity(identity)
-
-        await self._audit(
-            event_type="identity_reactivated",
-            agent_id=agent_id,
-            actor=actor,
-            details={}
-        )
-
-        return identity
-
-    # -------------------------------------------------------------------------
-    # Token Management
-    # -------------------------------------------------------------------------
-
-    async def issue_token(
-        self,
-        agent_id: str,
-        scopes: list[PermissionScope] | None = None,
-        ttl_hours: int = 24,
-        actor: str = "system"
-    ) -> str:
-        """Issue a new authentication token for an agent"""
-        identity = await self.store.get_identity(agent_id)
-        if not identity:
-            raise ValueError(f"Identity not found: {agent_id}")
-
-        if not identity.is_valid():
-            raise ValueError(f"Identity is not valid: {identity.status.value}")
-
-        # Use agent's permissions if no scopes specified
-        if scopes is None:
-            scopes = identity.permissions
-
-        # Verify requested scopes are allowed
-        for scope in scopes:
-            if not identity.has_permission(scope):
-                raise ValueError(f"Agent does not have permission: {scope.value}")
-
-        token, credential = await self._issue_token(identity, actor, scopes, ttl_hours)
-
-        await self._audit(
-            event_type="token_issued",
-            agent_id=agent_id,
-            actor=actor,
-            details={
-                "credential_id": credential.credential_id,
-                "scopes": [s.value for s in scopes],
-                "expires_at": credential.expires_at
-            }
+            token_hash=token_hash,
+            scopes=scopes,
+            created_at=datetime.utcnow(),
+            expires_at=datetime.utcnow() + timedelta(hours=24)
         )
 
         return token
 
-    async def _issue_token(
-        self,
-        identity: AgentIdentity,
-        actor: str,
-        scopes: list[PermissionScope] | None = None,
-        ttl_hours: int = 24
-    ) -> tuple[str, Credential]:
-        """Internal token issuance"""
-        now = datetime.now(timezone.utc)
-        expires_at = now + timedelta(hours=ttl_hours)
+    def authorize(self, token: str, required_scope: str) -> bool:
+        """Check if token has required scope."""
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        agent_token = self.tokens.get(token_hash)
 
-        # Generate token
-        token_id = str(uuid.uuid4())
+        if not agent_token:
+            return False
+
+        if agent_token.expires_at and agent_token.expires_at < datetime.utcnow():
+            return False
+
+        return required_scope in agent_token.scopes
+
+
+# =============================================================================
+# JWT Authentication (Section: JWT - JSON Web Tokens)
+# =============================================================================
+
+class JWTAuth:
+    def __init__(self, secret_key: str, algorithm: str = "HS256"):
+        self.secret_key = secret_key
+        self.algorithm = algorithm
+
+    def create_token(self, agent_id: str, scopes: list[str],
+                      ttl_hours: int = 24) -> str:
+        """Create a JWT for an agent."""
+        now = datetime.utcnow()
         payload = {
-            "sub": identity.agent_id,
-            "name": identity.name,
-            "owner": identity.owner,
-            "scopes": [s.value for s in (scopes or identity.permissions)],
-            "iat": int(now.timestamp()),
-            "exp": int(expires_at.timestamp()),
+            "sub": agent_id,  # Subject (agent ID)
+            "scopes": scopes,
+            "iat": now,       # Issued at
+            "exp": now + timedelta(hours=ttl_hours),  # Expiration
+            "jti": token_urlsafe(16)  # Unique token ID
+        }
+
+        return jwt.encode(payload, self.secret_key, algorithm=self.algorithm)
+
+    def verify_token(self, token: str) -> dict | None:
+        """Verify and decode a JWT."""
+        try:
+            payload = jwt.decode(
+                token,
+                self.secret_key,
+                algorithms=[self.algorithm]
+            )
+            return payload
+        except jwt.ExpiredSignatureError:
+            return None
+        except jwt.InvalidTokenError:
+            return None
+
+    def get_agent_id(self, token: str) -> str | None:
+        """Extract agent ID from token."""
+        payload = self.verify_token(token)
+        return payload.get("sub") if payload else None
+
+    def has_scope(self, token: str, required_scope: str) -> bool:
+        """Check if token has required scope."""
+        payload = self.verify_token(token)
+        if not payload:
+            return False
+        return required_scope in payload.get("scopes", [])
+
+
+# =============================================================================
+# Asymmetric JWT Signing (Section: Asymmetric JWT Signing)
+# =============================================================================
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+
+class AsymmetricJWTAuth:
+    def __init__(self, private_key_pem: bytes = None, public_key_pem: bytes = None):
+        if private_key_pem:
+            self.private_key = serialization.load_pem_private_key(
+                private_key_pem, password=None
+            )
+        else:
+            # Generate new key pair
+            self.private_key = rsa.generate_private_key(
+                public_exponent=65537,
+                key_size=2048
+            )
+
+        self.public_key = self.private_key.public_key() if self.private_key else (
+            serialization.load_pem_public_key(public_key_pem)
+        )
+
+    def create_token(self, agent_id: str, scopes: list[str],
+                      ttl_hours: int = 24) -> str:
+        """Create a JWT signed with private key."""
+        now = datetime.utcnow()
+        payload = {
+            "sub": agent_id,
+            "scopes": scopes,
+            "iat": now,
+            "exp": now + timedelta(hours=ttl_hours),
+            "jti": token_urlsafe(16)
+        }
+
+        return jwt.encode(payload, self.private_key, algorithm="RS256")
+
+    def verify_token(self, token: str) -> dict | None:
+        """Verify token with public key only."""
+        try:
+            return jwt.decode(token, self.public_key, algorithms=["RS256"])
+        except jwt.InvalidTokenError:
+            return None
+
+    def get_public_key_pem(self) -> bytes:
+        """Export public key for distribution."""
+        return self.public_key.public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+
+
+# =============================================================================
+# Identity Types (Section: Service Accounts vs Agent Accounts)
+# =============================================================================
+
+class IdentityType(Enum):
+    SERVICE = "service"    # Long-lived, for system components
+    AGENT = "agent"        # Potentially ephemeral, for AI agents
+    USER = "user"          # Human users
+    EXTERNAL = "external"  # Third-party integrations
+
+@dataclass
+class Identity:
+    id: str
+    type: IdentityType
+    name: str
+    parent_id: str | None = None  # For hierarchical relationships
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    metadata: dict = field(default_factory=dict)
+
+
+# =============================================================================
+# Agent Role and Identity (Section: A Complete Identity Service)
+# =============================================================================
+
+class AgentRole(Enum):
+    """High-level roles for access control"""
+    WORKER = "worker"
+    ORCHESTRATOR = "orchestrator"
+    GUARDIAN = "guardian"
+    ADMIN = "admin"
+
+@dataclass
+class AgentIdentity:
+    agent_id: str
+    name: str
+    role: AgentRole
+    scopes: set[str]  # Fine-grained permissions (e.g., "data:read")
+    metadata: dict = field(default_factory=dict)
+    created_at: datetime = field(default_factory=datetime.utcnow)
+
+    def to_claims(self) -> dict:
+        return {
+            "sub": self.agent_id,
+            "name": self.name,
+            "role": self.role.value,
+            "scopes": list(self.scopes)
+        }
+
+@dataclass
+class TokenInfo:
+    token_id: str
+    agent_id: str
+    issued_at: datetime
+    expires_at: datetime
+    revoked: bool = False
+
+
+class IdentityService:
+    """
+    Manages agent identities and authentication tokens.
+
+    Features:
+    - Agent registration and management
+    - JWT token issuance and verification
+    - Token revocation
+    - Scope-based authorization
+    """
+
+    def __init__(self, secret_key: str, issuer: str = "agent-system"):
+        self.secret_key = secret_key
+        self.issuer = issuer
+        self.agents: dict[str, AgentIdentity] = {}
+        self.tokens: dict[str, TokenInfo] = {}
+        self.revoked_tokens: set[str] = set()
+        logger.info(f"IdentityService initialized with issuer: {issuer}")
+
+    # ----- Agent Management -----
+
+    def register_agent(
+        self,
+        name: str,
+        role: AgentRole,
+        scopes: set[str] | None = None,
+        metadata: dict | None = None
+    ) -> AgentIdentity:
+        """Register a new agent identity."""
+        agent_id = f"agent_{token_urlsafe(8)}"
+
+        # Default scopes based on role
+        if scopes is None:
+            scopes = self._default_scopes(role)
+
+        identity = AgentIdentity(
+            agent_id=agent_id,
+            name=name,
+            role=role,
+            scopes=scopes,
+            metadata=metadata or {}
+        )
+
+        self.agents[agent_id] = identity
+        logger.info(f"Registered agent: {name} ({agent_id}) with role {role.value}")
+        return identity
+
+    def get_agent(self, agent_id: str) -> AgentIdentity | None:
+        """Get an agent's identity."""
+        return self.agents.get(agent_id)
+
+    def update_scopes(self, agent_id: str, scopes: set[str]):
+        """Update an agent's scopes."""
+        if agent_id in self.agents:
+            self.agents[agent_id].scopes = scopes
+            logger.info(f"Updated scopes for agent {agent_id}: {scopes}")
+
+    def delete_agent(self, agent_id: str):
+        """Delete an agent and revoke all its tokens."""
+        if agent_id in self.agents:
+            del self.agents[agent_id]
+            # Revoke all tokens for this agent
+            for token_id, info in self.tokens.items():
+                if info.agent_id == agent_id:
+                    self.revoked_tokens.add(token_id)
+            logger.info(f"Deleted agent {agent_id} and revoked all tokens")
+
+    def _default_scopes(self, role: AgentRole) -> set[str]:
+        """Default scopes for each role."""
+        base = {"read:self"}
+
+        if role == AgentRole.WORKER:
+            return base | {"execute:tasks"}
+        elif role == AgentRole.ORCHESTRATOR:
+            return base | {"execute:tasks", "delegate:tasks", "read:workers"}
+        elif role == AgentRole.GUARDIAN:
+            return base | {"validate:actions", "read:all", "block:actions"}
+        elif role == AgentRole.ADMIN:
+            return base | {"admin:*"}
+
+        return base
+
+    # ----- Token Management -----
+
+    def issue_token(
+        self,
+        agent_id: str,
+        ttl_hours: int = 24,
+        additional_claims: dict | None = None
+    ) -> str | None:
+        """Issue a JWT token for an agent."""
+        identity = self.agents.get(agent_id)
+        if not identity:
+            logger.warning(f"Token issuance failed: agent {agent_id} not found")
+            return None
+
+        now = datetime.utcnow()
+        token_id = token_urlsafe(16)
+
+        payload = {
+            **identity.to_claims(),
+            "iss": self.issuer,
+            "iat": now,
+            "exp": now + timedelta(hours=ttl_hours),
             "jti": token_id
         }
 
-        token = jwt.encode(payload, self.jwt_secret, algorithm="HS256")
+        if additional_claims:
+            payload.update(additional_claims)
 
-        # Store credential record
-        credential = Credential(
-            credential_id=token_id,
-            agent_id=identity.agent_id,
-            token_hash=hashlib.sha256(token.encode()).hexdigest(),
-            issued_at=now.isoformat(),
-            expires_at=expires_at.isoformat(),
-            scopes=[s.value for s in (scopes or identity.permissions)]
+        token = jwt.encode(payload, self.secret_key, algorithm="HS256")
+
+        # Track token for revocation
+        self.tokens[token_id] = TokenInfo(
+            token_id=token_id,
+            agent_id=agent_id,
+            issued_at=now,
+            expires_at=now + timedelta(hours=ttl_hours)
         )
-        await self.store.store_credential(credential)
 
-        return token, credential
+        logger.info(f"Issued token for agent {agent_id}, expires in {ttl_hours} hours")
+        return token
 
-    async def validate_token(self, token: str) -> dict:
-        """
-        Validate an authentication token.
-
-        Returns decoded payload if valid, raises exception otherwise.
-        """
+    def verify_token(self, token: str) -> dict | None:
+        """Verify a token and return its claims."""
         try:
-            payload = jwt.decode(token, self.jwt_secret, algorithms=["HS256"])
+            payload = jwt.decode(
+                token,
+                self.secret_key,
+                algorithms=["HS256"],
+                issuer=self.issuer
+            )
+
+            # Check if revoked
+            token_id = payload.get("jti")
+            if token_id in self.revoked_tokens:
+                logger.warning(f"Token {token_id} has been revoked")
+                return None
+
+            return payload
+
         except jwt.ExpiredSignatureError:
-            raise ValueError("Token has expired")
+            logger.warning("Token verification failed: expired")
+            return None
         except jwt.InvalidTokenError as e:
-            raise ValueError(f"Invalid token: {e}")
+            logger.warning(f"Token verification failed: {e}")
+            return None
 
-        # Check credential not revoked
-        credential = await self.store.get_credential(payload["jti"])
-        if not credential:
-            raise ValueError("Credential not found")
-        if credential.is_revoked:
-            raise ValueError("Credential has been revoked")
+    def revoke_token(self, token: str):
+        """Revoke a specific token."""
+        payload = self.verify_token(token)
+        if payload and "jti" in payload:
+            self.revoked_tokens.add(payload["jti"])
+            logger.info(f"Revoked token {payload['jti']}")
 
-        # Check identity still valid
-        identity = await self.store.get_identity(payload["sub"])
-        if not identity or not identity.is_valid():
-            raise ValueError("Agent identity is no longer valid")
+    def revoke_all_tokens(self, agent_id: str):
+        """Revoke all tokens for an agent."""
+        count = 0
+        for token_id, info in self.tokens.items():
+            if info.agent_id == agent_id:
+                self.revoked_tokens.add(token_id)
+                count += 1
+        logger.info(f"Revoked {count} tokens for agent {agent_id}")
 
-        # Update last used
-        identity.last_used = datetime.now(timezone.utc).isoformat()
-        await self.store.update_identity(identity)
+    # ----- Authorization -----
 
-        return payload
+    def authorize(self, token: str, required_scope: str) -> bool:
+        """Check if a token has the required scope."""
+        payload = self.verify_token(token)
+        if not payload:
+            return False
 
-    async def revoke_token(
-        self,
-        credential_id: str,
-        actor: str
-    ):
-        """Revoke a specific token"""
-        credential = await self.store.get_credential(credential_id)
-        if not credential:
-            raise ValueError(f"Credential not found: {credential_id}")
+        scopes = set(payload.get("scopes", []))
 
-        credential.is_revoked = True
-        await self.store.store_credential(credential)
+        # Check for admin wildcard
+        if "admin:*" in scopes:
+            return True
 
-        await self._audit(
-            event_type="token_revoked",
-            agent_id=credential.agent_id,
-            actor=actor,
-            details={"credential_id": credential_id}
-        )
+        # Check for exact match or wildcard
+        if required_scope in scopes:
+            return True
 
-    async def rotate_credentials(
-        self,
-        agent_id: str,
-        actor: str
-    ) -> str:
-        """
-        Rotate credentials by revoking all existing and issuing new.
+        # Check for category wildcard (e.g., "read:*" matches "read:customers")
+        category = required_scope.split(":")[0]
+        if f"{category}:*" in scopes:
+            return True
 
-        This is useful for periodic security rotation or after
-        a suspected compromise.
-        """
-        identity = await self.store.get_identity(agent_id)
-        if not identity:
-            raise ValueError(f"Identity not found: {agent_id}")
+        return False
 
-        # Revoke all existing credentials
-        credentials = await self.store.get_credentials_for_agent(agent_id)
-        for cred in credentials:
-            cred.is_revoked = True
-            await self.store.store_credential(cred)
-
-        # Issue new token
-        new_token = await self.issue_token(agent_id, actor=actor)
-
-        await self._audit(
-            event_type="credentials_rotated",
-            agent_id=agent_id,
-            actor=actor,
-            details={"credentials_revoked": len(credentials)}
-        )
-
-        return new_token
-
-    # -------------------------------------------------------------------------
-    # Permission Management
-    # -------------------------------------------------------------------------
-
-    async def grant_permission(
-        self,
-        agent_id: str,
-        permission: PermissionScope,
-        actor: str
-    ) -> AgentIdentity:
-        """Grant additional permission to an agent"""
-        identity = await self.store.get_identity(agent_id)
-        if not identity:
-            raise ValueError(f"Identity not found: {agent_id}")
-
-        if permission not in identity.permissions:
-            identity.permissions.append(permission)
-            await self.store.update_identity(identity)
-
-            await self._audit(
-                event_type="permission_granted",
-                agent_id=agent_id,
-                actor=actor,
-                details={"permission": permission.value}
-            )
-
-        return identity
-
-    async def revoke_permission(
-        self,
-        agent_id: str,
-        permission: PermissionScope,
-        actor: str
-    ) -> AgentIdentity:
-        """Revoke a permission from an agent"""
-        identity = await self.store.get_identity(agent_id)
-        if not identity:
-            raise ValueError(f"Identity not found: {agent_id}")
-
-        if permission in identity.permissions:
-            identity.permissions.remove(permission)
-            await self.store.update_identity(identity)
-
-            await self._audit(
-                event_type="permission_revoked",
-                agent_id=agent_id,
-                actor=actor,
-                details={"permission": permission.value}
-            )
-
-        return identity
-
-    # -------------------------------------------------------------------------
-    # Audit
-    # -------------------------------------------------------------------------
-
-    async def _audit(
-        self,
-        event_type: str,
-        agent_id: str,
-        actor: str,
-        details: dict,
-        ip_address: str | None = None
-    ):
-        """Record audit event"""
-        event = AuditEvent(
-            event_id=str(uuid.uuid4()),
-            event_type=event_type,
-            agent_id=agent_id,
-            actor=actor,
-            timestamp=datetime.now(timezone.utc).isoformat(),
-            details=details,
-            ip_address=ip_address
-        )
-        await self.store.log_audit_event(event)
-
-    async def get_audit_log(
-        self,
-        agent_id: str | None = None,
-        since: datetime | None = None
-    ) -> list[AuditEvent]:
-        """Get audit log for an agent or all agents"""
-        return await self.store.get_audit_log(agent_id, since)
+    def get_agent_from_token(self, token: str) -> AgentIdentity | None:
+        """Get the agent identity from a token."""
+        payload = self.verify_token(token)
+        if not payload:
+            return None
+        return self.agents.get(payload.get("sub"))
 
 
 # =============================================================================
-# Authentication Middleware
+# Authentication Middleware (Section: A Complete Identity Service)
 # =============================================================================
 
-class AgentAuthenticator:
-    """
-    Middleware for authenticating agent requests.
+class AuthenticationError(Exception):
+    pass
 
-    Use this in API endpoints to validate agent identity.
-    """
+class AuthorizationError(Exception):
+    pass
 
-    def __init__(self, identity_service: AgentIdentityService):
+
+class AuthMiddleware:
+    """Middleware for authenticating agent requests."""
+
+    def __init__(self, identity_service: IdentityService):
         self.identity_service = identity_service
 
-    async def authenticate(self, token: str) -> AgentIdentity:
-        """
-        Authenticate a request using agent token.
+    async def authenticate(self, request: dict) -> AgentIdentity | None:
+        """Authenticate a request and return the agent identity."""
+        # Get token from header
+        auth_header = request.get("headers", {}).get("Authorization", "")
 
-        Returns the agent's identity if valid.
-        """
-        payload = await self.identity_service.validate_token(token)
-        identity = await self.identity_service.get_identity(payload["sub"])
-        if not identity:
-            raise ValueError("Agent identity not found")
-        return identity
+        if not auth_header.startswith("Bearer "):
+            return None
 
-    async def authorize(
-        self,
-        token: str,
-        required_scope: PermissionScope
-    ) -> AgentIdentity:
-        """
-        Authenticate and authorize for a specific scope.
+        token = auth_header[7:]  # Remove "Bearer " prefix
+        return self.identity_service.get_agent_from_token(token)
 
-        Returns identity if authorized, raises exception otherwise.
-        """
-        identity = await self.authenticate(token)
+    def require_scope(self, scope: str):
+        """Decorator to require a specific scope."""
+        def decorator(func):
+            async def wrapper(request, *args, **kwargs):
+                auth_header = request.get("headers", {}).get("Authorization", "")
+                if not auth_header.startswith("Bearer "):
+                    raise AuthenticationError("Missing authentication")
 
-        if not identity.has_permission(required_scope):
-            raise PermissionError(
-                f"Agent {identity.agent_id} does not have permission: {required_scope.value}"
-            )
+                token = auth_header[7:]
+                if not self.identity_service.authorize(token, scope):
+                    raise AuthorizationError(f"Missing required scope: {scope}")
 
-        return identity
+                return await func(request, *args, **kwargs)
+            return wrapper
+        return decorator
 
 
 # =============================================================================
-# Usage Example
+# Agent-to-Agent Authentication (Section: Authentication Flows)
+# =============================================================================
+
+class AuthenticatedAgent:
+    def __init__(self, identity: AgentIdentity, token: str):
+        self.identity = identity
+        self.token = token
+
+    async def call_agent(self, target_url: str, request: dict) -> dict:
+        """Call another agent with authentication."""
+        headers = {
+            "Authorization": f"Bearer {self.token}",
+            "X-Agent-ID": self.identity.agent_id
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                    target_url, json=request, headers=headers) as resp:
+                return await resp.json()
+
+
+# =============================================================================
+# Token Refresh (Section: Token Refresh)
+# =============================================================================
+
+class TokenManager:
+    def __init__(self, identity_service: IdentityService, agent_id: str):
+        self.service = identity_service
+        self.agent_id = agent_id
+        self.current_token: str | None = None
+        self.refresh_threshold = timedelta(hours=1)
+
+    async def get_token(self) -> str:
+        """Get a valid token, refreshing if needed."""
+        if self.current_token:
+            payload = self.service.verify_token(self.current_token)
+            if payload:
+                exp = datetime.fromtimestamp(payload["exp"])
+                if exp - datetime.utcnow() > self.refresh_threshold:
+                    return self.current_token
+
+        # Need new token
+        self.current_token = self.service.issue_token(self.agent_id)
+        logger.info(f"Refreshed token for agent {self.agent_id}")
+        return self.current_token
+
+    async def refresh_loop(self):
+        """Background task to keep token fresh."""
+        while True:
+            await asyncio.sleep(3600)  # Check every hour
+            await self.get_token()
+
+
+# =============================================================================
+# Audit Logging (Section: Audit Logging)
+# =============================================================================
+
+# Type alias for storage interface
+class Storage:
+    def append(self, entry: dict):
+        pass
+
+@dataclass
+class AuditEntry:
+    timestamp: datetime
+    agent_id: str
+    action: str
+    resource: str
+    outcome: str  # "success", "denied", "error"
+    details: dict = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return {
+            "timestamp": self.timestamp.isoformat(),
+            "agent_id": self.agent_id,
+            "action": self.action,
+            "resource": self.resource,
+            "outcome": self.outcome,
+            "details": self.details
+        }
+
+class AuditLog:
+    def __init__(self, storage: Storage | None = None):
+        self.entries: list[AuditEntry] = []
+        self.storage = storage
+
+    def log(self, agent_id: str, action: str, resource: str,
+            outcome: str, details: dict = None):
+        """Log an agent action."""
+        entry = AuditEntry(
+            timestamp=datetime.utcnow(),
+            agent_id=agent_id,
+            action=action,
+            resource=resource,
+            outcome=outcome,
+            details=details or {}
+        )
+
+        self.entries.append(entry)
+        logger.info(f"Audit: {agent_id} {action} {resource} -> {outcome}")
+
+        if self.storage:
+            self.storage.append(entry.to_dict())
+
+    def query(self, agent_id: str = None, action: str = None,
+              start_time: datetime = None,
+              end_time: datetime = None) -> list[AuditEntry]:
+        """Query audit log."""
+        results = self.entries
+
+        if agent_id:
+            results = [e for e in results if e.agent_id == agent_id]
+        if action:
+            results = [e for e in results if e.action == action]
+        if start_time:
+            results = [e for e in results if e.timestamp >= start_time]
+        if end_time:
+            results = [e for e in results if e.timestamp <= end_time]
+
+        return results
+
+
+# =============================================================================
+# Secure Agent Integration (Section: Integrating Identity with Agents)
+# =============================================================================
+
+class SecureAgent:
+    def __init__(
+        self,
+        identity_service: IdentityService,
+        audit_log: AuditLog,
+        name: str,
+        role: AgentRole
+    ):
+        self.identity_service = identity_service
+        self.audit_log = audit_log
+
+        # Register and get identity
+        self.identity = identity_service.register_agent(name=name, role=role)
+        self.token_manager = TokenManager(identity_service, self.identity.agent_id)
+
+    async def execute_action(self, action: str, resource: str, **kwargs) -> Any:
+        """Execute an action with authentication and audit."""
+        token = await self.token_manager.get_token()
+
+        # Check authorization
+        required_scope = f"{action}:{resource.split('/')[0]}"
+        if not self.identity_service.authorize(token, required_scope):
+            self.audit_log.log(
+                agent_id=self.identity.agent_id,
+                action=action,
+                resource=resource,
+                outcome="denied",
+                details={"reason": "insufficient_scope"}
+            )
+            raise AuthorizationError(f"Not authorized for {required_scope}")
+
+        # Execute
+        try:
+            result = await self._do_action(action, resource, **kwargs)
+            self.audit_log.log(
+                agent_id=self.identity.agent_id,
+                action=action,
+                resource=resource,
+                outcome="success"
+            )
+            return result
+        except Exception as e:
+            self.audit_log.log(
+                agent_id=self.identity.agent_id,
+                action=action,
+                resource=resource,
+                outcome="error",
+                details={"error": str(e)}
+            )
+            raise
+
+    async def _do_action(self, action: str, resource: str, **kwargs) -> Any:
+        """Override in subclass to implement actual action."""
+        raise NotImplementedError
+
+
+# =============================================================================
+# Hierarchical Identity (Section: Identity Inheritance)
+# =============================================================================
+
+class HierarchicalIdentityService(IdentityService):
+    def spawn_child(
+        self,
+        parent_token: str,
+        child_name: str,
+        scope_subset: set[str] | None = None
+    ) -> tuple[AgentIdentity, str]:
+        """Create a child identity with inherited permissions."""
+
+        parent_payload = self.verify_token(parent_token)
+        if not parent_payload:
+            raise AuthenticationError("Invalid parent token")
+
+        parent_id = parent_payload["sub"]
+        parent_scopes = set(parent_payload.get("scopes", []))
+
+        # Child scopes are subset of parent scopes
+        if scope_subset:
+            child_scopes = parent_scopes & scope_subset
+        else:
+            child_scopes = parent_scopes
+
+        # Create child identity
+        child_id = f"{parent_id}:child_{token_urlsafe(8)}"
+
+        child_identity = AgentIdentity(
+            agent_id=child_id,
+            name=child_name,
+            role=AgentRole.WORKER,
+            scopes=child_scopes,
+            metadata={"parent_id": parent_id}
+        )
+
+        self.agents[child_id] = child_identity
+        logger.info(f"Spawned child agent {child_id} from parent {parent_id}")
+
+        # Issue token with parent reference
+        child_token = self.issue_token(
+            child_id,
+            additional_claims={"parent": parent_id}
+        )
+
+        return child_identity, child_token
+
+
+# =============================================================================
+# Impersonation Service (Section: Impersonation)
+# =============================================================================
+
+class ImpersonationService:
+    def __init__(self, identity_service: IdentityService):
+        self.service = identity_service
+        self.allowed_impersonation: dict[str, set[str]] = {}
+
+    def allow_impersonation(self, impersonator: str, target: str):
+        """Grant impersonation permission."""
+        if impersonator not in self.allowed_impersonation:
+            self.allowed_impersonation[impersonator] = set()
+        self.allowed_impersonation[impersonator].add(target)
+        logger.info(f"Allowed {impersonator} to impersonate {target}")
+
+    def impersonate(
+        self,
+        impersonator_token: str,
+        target_id: str
+    ) -> str | None:
+        """Create a token that acts as target identity."""
+
+        impersonator_payload = self.service.verify_token(impersonator_token)
+        if not impersonator_payload:
+            return None
+
+        impersonator_id = impersonator_payload["sub"]
+
+        # Check permission
+        if target_id not in self.allowed_impersonation.get(impersonator_id, set()):
+            logger.warning(f"Impersonation denied: {impersonator_id} -> {target_id}")
+            return None
+
+        # Issue token for target with impersonation metadata
+        target_identity = self.service.get_agent(target_id)
+        if not target_identity:
+            return None
+
+        logger.info(f"Agent {impersonator_id} impersonating {target_id}")
+        return self.service.issue_token(
+            target_id,
+            additional_claims={
+                "act": {"sub": impersonator_id},  # Acting party claim
+                "impersonated": True
+            }
+        )
+
+
+# =============================================================================
+# Constrained Delegation (Section: Constrained Delegation)
+# =============================================================================
+
+@dataclass
+class DelegationGrant:
+    delegator: str
+    delegate: str
+    scopes: set[str]
+    constraints: dict
+    expires_at: datetime
+
+    def is_valid(self) -> bool:
+        return datetime.utcnow() < self.expires_at
+
+    def can_use_scope(self, scope: str) -> bool:
+        return scope in self.scopes and self.is_valid()
+
+class DelegationService:
+    def __init__(self):
+        self.grants: dict[str, DelegationGrant] = {}
+
+    def create_grant(
+        self,
+        delegator_token: str,
+        delegate_id: str,
+        scopes: set[str],
+        identity_service: IdentityService,
+        constraints: dict = None,
+        ttl_hours: int = 24
+    ) -> DelegationGrant:
+        """Create a delegation grant."""
+
+        payload = identity_service.verify_token(delegator_token)
+        if not payload:
+            raise AuthenticationError("Invalid delegator token")
+
+        delegator_scopes = set(payload.get("scopes", []))
+
+        # Can only delegate scopes you have
+        granted_scopes = scopes & delegator_scopes
+
+        grant = DelegationGrant(
+            delegator=payload["sub"],
+            delegate=delegate_id,
+            scopes=granted_scopes,
+            constraints=constraints or {},
+            expires_at=datetime.utcnow() + timedelta(hours=ttl_hours)
+        )
+
+        grant_id = f"grant_{token_urlsafe(8)}"
+        self.grants[grant_id] = grant
+        logger.info(f"Created delegation grant {grant_id}: {payload['sub']} -> {delegate_id}")
+
+        return grant
+
+
+# =============================================================================
+# Security Best Practices
+# =============================================================================
+
+# Principle of Least Privilege (Section: Principle of Least Privilege)
+
+class LeastPrivilegeAssigner:
+    """Automatically determine minimum required scopes."""
+
+    def __init__(self):
+        self.action_to_scopes: dict[str, set[str]] = {
+            "read_document": {"read:documents"},
+            "search": {"read:search"},
+            "write_document": {"write:documents"},
+            "send_email": {"execute:email"},
+            "call_api": {"execute:external_apis"},
+        }
+
+    def scopes_for_task(self, task_description: str) -> set[str]:
+        """Determine scopes needed for a task."""
+        needed = set()
+
+        for action, scopes in self.action_to_scopes.items():
+            if action in task_description.lower():
+                needed |= scopes
+
+        return needed
+
+    def issue_task_token(
+        self,
+        identity_service: IdentityService,
+        agent_id: str,
+        task_description: str
+    ) -> str:
+        """Issue a token scoped to a specific task."""
+
+        scopes = self.scopes_for_task(task_description)
+        agent = identity_service.get_agent(agent_id)
+
+        if not agent:
+            raise ValueError(f"Agent not found: {agent_id}")
+
+        # Intersect with agent's allowed scopes
+        available_scopes = agent.scopes & scopes
+
+        logger.info(f"Issuing task-scoped token for {agent_id}: {available_scopes}")
+        return identity_service.issue_token(
+            agent_id,
+            ttl_hours=1,  # Short-lived
+            additional_claims={
+                "scopes": list(available_scopes),
+                "task": task_description[:100]
+            }
+        )
+
+
+# Token Security (Section: Token Security)
+
+class SecureTokenStorage:
+    """Store tokens securely."""
+
+    def __init__(self, encryption_key: bytes):
+        from cryptography.fernet import Fernet
+        self.fernet = Fernet(encryption_key)
+        self.tokens: dict[str, bytes] = {}
+
+    def store(self, agent_id: str, token: str):
+        """Encrypt and store a token."""
+        encrypted = self.fernet.encrypt(token.encode())
+        self.tokens[agent_id] = encrypted
+        logger.info(f"Stored encrypted token for {agent_id}")
+
+    def retrieve(self, agent_id: str) -> str | None:
+        """Retrieve and decrypt a token."""
+        encrypted = self.tokens.get(agent_id)
+        if not encrypted:
+            return None
+        return self.fernet.decrypt(encrypted).decode()
+
+    def clear(self, agent_id: str):
+        """Remove a stored token."""
+        if agent_id in self.tokens:
+            del self.tokens[agent_id]
+            logger.info(f"Cleared stored token for {agent_id}")
+
+
+# Rotation and Revocation (Section: Rotation and Revocation)
+
+class CredentialRotator:
+    """Automatic credential rotation."""
+
+    def __init__(
+        self,
+        identity_service: IdentityService,
+        rotation_interval: timedelta = timedelta(hours=12)
+    ):
+        self.service = identity_service
+        self.interval = rotation_interval
+        self.last_rotation: dict[str, datetime] = {}
+
+    async def ensure_fresh(self, agent_id: str) -> str:
+        """Ensure agent has a fresh token."""
+        last = self.last_rotation.get(agent_id)
+        now = datetime.utcnow()
+
+        if not last or (now - last) > self.interval:
+            # Revoke old tokens
+            self.service.revoke_all_tokens(agent_id)
+
+            # Issue new token
+            token = self.service.issue_token(agent_id)
+            self.last_rotation[agent_id] = now
+            logger.info(f"Rotated credentials for {agent_id}")
+            return token
+
+        return self.service.issue_token(agent_id)
+
+    async def emergency_revoke(self, agent_id: str):
+        """Emergency revocation on compromise detection."""
+        self.service.revoke_all_tokens(agent_id)
+        # Also log the incident
+        logger.critical(f"Emergency revocation for {agent_id}")
+
+
+# =============================================================================
+# Demo / Main
 # =============================================================================
 
 async def main():
-    """Demonstrate identity service usage"""
-
-    print("=" * 60)
-    print("Agent Identity Service Demo")
-    print("=" * 60)
+    """Demonstrate identity service usage."""
 
     # Initialize service
-    store = IdentityStore()
-    key_vault = KeyVault()
+    service = IdentityService(secret_key="your-secret-key-here")
 
-    # In production, load JWT secret from environment or secrets manager
-    # NEVER hardcode secrets in production code
-    import os
-    jwt_secret = os.environ.get("JWT_SECRET", secrets.token_urlsafe(32))
-    if "JWT_SECRET" not in os.environ:
-        print("   WARNING: Using generated JWT secret. Set JWT_SECRET env var in production.")
-
-    service = AgentIdentityService(
-        store=store,
-        key_vault=key_vault,
-        jwt_secret=jwt_secret
+    # Register agents
+    orchestrator = service.register_agent(
+        name="Main Orchestrator",
+        role=AgentRole.ORCHESTRATOR
     )
-    auth = AgentAuthenticator(service)
+    print(f"Registered: {orchestrator.name} ({orchestrator.agent_id})")
+    print(f"  Scopes: {orchestrator.scopes}")
 
-    # 1. Provision a new agent
-    print("\n1. Provisioning new agent identity...")
-    identity, token = await service.provision_identity(
-        name="procurement-agent",
-        owner="supply-chain-team",
-        permissions=[
-            PermissionScope.READ_DATA,
-            PermissionScope.WRITE_DATA,
-            PermissionScope.INVOKE_TOOLS
-        ],
-        metadata={"environment": "production", "version": "1.0"}
+    worker = service.register_agent(
+        name="Research Worker",
+        role=AgentRole.WORKER,
+        scopes={"read:self", "execute:tasks", "read:documents"}
     )
-    print(f"   Agent ID: {identity.agent_id}")
-    print(f"   Status: {identity.status.value}")
-    print(f"   Permissions: {[p.value for p in identity.permissions]}")
-    print(f"   Token: {token[:50]}...")
+    print(f"Registered: {worker.name} ({worker.agent_id})")
 
-    # 2. Validate token
-    print("\n2. Validating token...")
-    try:
-        validated_identity = await auth.authenticate(token)
-        print(f"   Token valid for: {validated_identity.name}")
-    except Exception as e:
-        print(f"   Error: {e}")
-
-    # 3. Authorize for specific scope
-    print("\n3. Authorizing for scope...")
-    try:
-        await auth.authorize(token, PermissionScope.READ_DATA)
-        print("   Authorized for data:read")
-
-        await auth.authorize(token, PermissionScope.ACCESS_SECRETS)
-        print("   Authorized for secrets:access")
-    except PermissionError as e:
-        print(f"   Permission denied: {e}")
-
-    # 4. Grant new permission
-    print("\n4. Granting new permission...")
-    identity = await service.grant_permission(
-        identity.agent_id,
-        PermissionScope.INVOKE_AGENTS,
-        actor="admin"
+    guardian = service.register_agent(
+        name="Safety Guardian",
+        role=AgentRole.GUARDIAN
     )
-    print(f"   New permissions: {[p.value for p in identity.permissions]}")
+    print(f"Registered: {guardian.name} ({guardian.agent_id})")
 
-    # 5. Rotate credentials
-    print("\n5. Rotating credentials...")
-    new_token = await service.rotate_credentials(identity.agent_id, actor="security-bot")
-    print(f"   New token: {new_token[:50]}...")
+    # Issue tokens
+    orch_token = service.issue_token(orchestrator.agent_id)
+    worker_token = service.issue_token(worker.agent_id)
 
-    # Verify old token is invalid
-    try:
-        await auth.authenticate(token)
-        print("   Old token still valid (unexpected!)")
-    except ValueError as e:
-        print(f"   Old token correctly rejected: {e}")
+    # Verify and authorize
+    orch_can_delegate = service.authorize(orch_token, 'delegate:tasks')
+    print(f"\nOrchestrator can delegate: {orch_can_delegate}")
+    wkr_can_delegate = service.authorize(worker_token, 'delegate:tasks')
+    print(f"Worker can delegate: {wkr_can_delegate}")
+    wkr_can_read = service.authorize(worker_token, 'read:documents')
+    print(f"Worker can read documents: {wkr_can_read}")
 
-    # 6. View audit log
-    print("\n6. Audit Log:")
-    events = await service.get_audit_log(identity.agent_id)
-    for event in events[-5:]:
-        print(f"   [{event.timestamp}] {event.event_type} by {event.actor}")
-
-    # 7. Revoke identity
-    print("\n7. Revoking identity...")
-    identity = await service.revoke_identity(
-        identity.agent_id,
-        reason="Demo cleanup",
-        actor="admin"
-    )
-    print(f"   Status: {identity.status.value}")
-    print(f"   Revoked at: {identity.revoked_at}")
-
+    # Revoke token
+    service.revoke_token(worker_token)
+    still_valid = service.verify_token(worker_token) is not None
+    print(f"\nAfter revocation, worker token valid: {still_valid}")
 
 if __name__ == "__main__":
     asyncio.run(main())

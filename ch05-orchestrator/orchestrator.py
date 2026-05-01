@@ -9,7 +9,15 @@ The orchestrator pattern uses a central agent to:
 3. Coordinate parallel/sequential execution
 4. Aggregate results into final output
 
-This implementation uses LangGraph for the orchestration graph.
+Two implementations are provided:
+- SimpleOrchestrator: No external dependencies, good starting point
+- MultiAgentOrchestrator: Uses LangGraph for advanced features (checkpointing, etc.)
+
+To run without LangGraph, use SimpleOrchestrator:
+    orchestrator = SimpleOrchestrator()
+    result = await orchestrator.run("your task")
+
+To use the full LangGraph version, install: pip install langgraph
 """
 
 import asyncio
@@ -326,16 +334,6 @@ class TaskPlanner:
         subtasks.append(writing)
         execution_plan.append([writing.id])
 
-        # Phase 4: Review (depends on writing)
-        review = Subtask(
-            id=f"review_{uuid.uuid4().hex[:8]}",
-            description="Review and validate final output",
-            worker_type=WorkerType.REVIEW,
-            dependencies=[writing.id]
-        )
-        subtasks.append(review)
-        execution_plan.append([review.id])
-
         return subtasks, execution_plan
 
 
@@ -388,7 +386,7 @@ class ResultAggregator:
             "\n## Research Summary\n",
             *[f"- {f.get('summary', '')}\n" for f in research_findings],
             "\n## Analysis\n",
-            *[f"Key insights: {a.get('key_insights', [])}\n" for a in analysis_results],
+            *[f"Insights: {a.get('key_insights', [])}\n" for a in analysis_results],
             "\n## Content\n",
             *written_content,
             "\n## Review\n",
@@ -613,31 +611,20 @@ class SimpleOrchestrator:
         }
 
     async def run(self, task: str, context: dict | None = None) -> dict:
-        """
-        Run task through orchestration pipeline.
-
-        This simple version uses a fixed pipeline:
-        Research -> Analysis -> Writing -> Review
-        """
+        """Run task through orchestration pipeline."""
         context = context or {}
         results = {}
 
         # Phase 1: Research (parallel)
         research_tasks = [
             self.workers[WorkerType.RESEARCH].execute(
-                Subtask(
-                    id="research_1",
-                    description=f"Research: {task}",
-                    worker_type=WorkerType.RESEARCH
-                ),
+                Subtask(id="research_1", description=f"Research: {task}",
+                        worker_type=WorkerType.RESEARCH),
                 context
             ),
             self.workers[WorkerType.RESEARCH].execute(
-                Subtask(
-                    id="research_2",
-                    description=f"Research trends: {task}",
-                    worker_type=WorkerType.RESEARCH
-                ),
+                Subtask(id="research_2", description=f"Research trends: {task}",
+                        worker_type=WorkerType.RESEARCH),
                 context
             )
         ]
@@ -646,45 +633,26 @@ class SimpleOrchestrator:
 
         # Phase 2: Analysis
         analysis_result = await self.workers[WorkerType.ANALYSIS].execute(
-            Subtask(
-                id="analysis",
-                description=f"Analyze: {task}",
-                worker_type=WorkerType.ANALYSIS,
-                input_data={"research": research_results}
-            ),
+            Subtask(id="analysis", description=f"Analyze: {task}",
+                    worker_type=WorkerType.ANALYSIS,
+                    input_data={"research": research_results}),
             context
         )
         results["analysis"] = analysis_result
 
         # Phase 3: Writing
         writing_result = await self.workers[WorkerType.WRITING].execute(
-            Subtask(
-                id="writing",
-                description=f"Write report: {task}",
-                worker_type=WorkerType.WRITING,
-                input_data={"analysis": analysis_result}
-            ),
+            Subtask(id="writing", description=f"Write report: {task}",
+                    worker_type=WorkerType.WRITING,
+                    input_data={"analysis": analysis_result}),
             context
         )
         results["writing"] = writing_result
-
-        # Phase 4: Review
-        review_result = await self.workers[WorkerType.REVIEW].execute(
-            Subtask(
-                id="review",
-                description="Review output",
-                worker_type=WorkerType.REVIEW,
-                input_data={"writing": writing_result}
-            ),
-            context
-        )
-        results["review"] = review_result
 
         return {
             "task": task,
             "results": results,
             "final_output": writing_result.get("content", ""),
-            "review_score": review_result.get("review", {}).get("score", 0),
             "status": "completed"
         }
 
@@ -708,7 +676,6 @@ async def main():
 
     print(f"\nTask: {result['task']}")
     print(f"Status: {result['status']}")
-    print(f"Review Score: {result['review_score']}")
     print(f"\nFinal Output:\n{result['final_output'][:500]}...")
 
     print("\n" + "=" * 60)

@@ -9,122 +9,151 @@ Based on OpenAI Swarm concepts and ant colony optimization principles.
 """
 
 import asyncio
+import math
 import random
 import time
+import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
+from itertools import cycle
 from typing import Any, Callable, Optional
 from collections import defaultdict
 import json
 import hashlib
 
+# Assume embedding utilities available (e.g., from openai or sentence_transformers)
+# def get_embedding(text: str) -> list[float]: ...
+# def cosine_similarity(a: list[float], b: list[float]) -> float: ...
+
+# Placeholder implementations for embedding utilities
+def get_embedding(text: str) -> list[float]:
+    """Placeholder for embedding function."""
+    # Simple hash-based pseudo-embedding for demonstration
+    h = hashlib.md5(text.encode()).hexdigest()
+    return [int(h[i:i+2], 16) / 255.0 for i in range(0, 32, 2)]
+
+def cosine_similarity(a: list[float], b: list[float]) -> float:
+    """Compute cosine similarity between two vectors."""
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(y * y for y in b))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
 
 class PheromoneType(Enum):
     """Types of pheromones for indirect agent communication."""
-    SUCCESS = "success"          # Task completed successfully
-    FAILURE = "failure"          # Task failed, avoid this path
-    EXPLORATION = "exploration"  # New territory being explored
-    RESOURCE = "resource"        # Resource discovered
-    DANGER = "danger"            # Hazard or constraint detected
-    ASSISTANCE = "assistance"    # Help needed
+    VALUE = "value"           # Something useful here
+    EXPLORED = "explored"     # Already checked this
+    DANGER = "danger"         # Problem or dead end
+    QUESTION = "question"     # Needs investigation
+    SYNTHESIS = "synthesis"   # Multiple sources combined here
+    RESOURCE = "resource"     # Resource availability signal
 
 
 @dataclass
 class Pheromone:
     """A pheromone marker left by an agent."""
     type: PheromoneType
-    location: str  # Task or resource identifier
-    intensity: float  # 0.0 to 1.0
-    metadata: dict = field(default_factory=dict)
-    timestamp: float = field(default_factory=time.time)
-    agent_id: str = ""
+    location: str             # Where in the problem space
+    intensity: float          # 0.0 to 1.0
+    data: dict = field(default_factory=dict)
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_by: str = ""
 
-    def decay(self, rate: float = 0.1) -> float:
-        """Apply time-based decay to pheromone intensity."""
-        age = time.time() - self.timestamp
-        decay_factor = max(0, 1 - (rate * age))
-        self.intensity *= decay_factor
-        return self.intensity
+    def decay(self, rate: float = 0.1) -> "Pheromone":
+        """Pheromones weaken over time."""
+        age_seconds = (datetime.utcnow() - self.created_at).total_seconds()
+        decay_factor = max(0, 1 - (rate * age_seconds / 3600))
+        return Pheromone(
+            type=self.type,
+            location=self.location,
+            intensity=self.intensity * decay_factor,
+            data=self.data,
+            created_at=self.created_at,
+            created_by=self.created_by
+        )
 
     def reinforce(self, amount: float = 0.2):
         """Reinforce pheromone when path is used again."""
         self.intensity = min(1.0, self.intensity + amount)
-        self.timestamp = time.time()
+        self.created_at = datetime.utcnow()
 
 
-class PheromoneTrail:
+class PheromoneField:
     """
     Shared environment for pheromone-based communication.
     Implements stigmergic coordination - agents communicate
     indirectly through modifications to the environment.
     """
 
-    def __init__(self, decay_rate: float = 0.05):
-        self.trails: dict[str, list[Pheromone]] = defaultdict(list)
-        self.decay_rate = decay_rate
-        self._lock = asyncio.Lock()
+    def __init__(self):
+        self.pheromones: list[Pheromone] = []
 
-    async def deposit(self, pheromone: Pheromone):
-        """Deposit a pheromone at a location."""
-        async with self._lock:
-            existing = self._find_matching(pheromone)
-            if existing:
-                existing.reinforce(pheromone.intensity * 0.5)
-                existing.metadata.update(pheromone.metadata)
-            else:
-                self.trails[pheromone.location].append(pheromone)
+    def deposit(self, pheromone: Pheromone):
+        """Add a pheromone to the field."""
+        self.pheromones.append(pheromone)
 
-    def _find_matching(self, pheromone: Pheromone) -> Optional[Pheromone]:
-        """Find existing pheromone of same type at location."""
-        for p in self.trails[pheromone.location]:
-            if p.type == pheromone.type:
-                return p
-        return None
-
-    async def sense(self, location: str,
-                    pheromone_type: Optional[PheromoneType] = None) -> list[Pheromone]:
-        """Sense pheromones at a location."""
-        async with self._lock:
-            await self._apply_decay()
-            pheromones = self.trails.get(location, [])
-            if pheromone_type:
-                return [p for p in pheromones if p.type == pheromone_type]
-            return list(pheromones)
-
-    async def sense_nearby(self, location: str, radius: int = 2) -> dict[str, list[Pheromone]]:
-        """Sense pheromones in nearby locations (for exploration)."""
-        nearby = {}
-        for loc, pheromones in self.trails.items():
-            if self._location_distance(location, loc) <= radius:
-                nearby[loc] = pheromones
+    def sense(self, location: str, radius: float = 0.5) -> list[Pheromone]:
+        """Detect pheromones near a location."""
+        nearby = []
+        for p in self.pheromones:
+            if self.distance(location, p.location) <= radius:
+                decayed = p.decay()
+                if decayed.intensity > 0.01:  # Threshold
+                    nearby.append(decayed)
         return nearby
 
-    def _location_distance(self, loc1: str, loc2: str) -> int:
-        """Simple distance heuristic based on location similarity."""
-        parts1 = loc1.split("/")
-        parts2 = loc2.split("/")
-        common = sum(1 for a, b in zip(parts1, parts2) if a == b)
-        return max(len(parts1), len(parts2)) - common
+    def sense_type(self, ptype: PheromoneType, top_k: int = 10) -> list[Pheromone]:
+        """Find strongest pheromones of a type."""
+        matching = [p.decay() for p in self.pheromones if p.type == ptype]
+        matching.sort(key=lambda p: p.intensity, reverse=True)
+        return matching[:top_k]
 
-    async def _apply_decay(self):
-        """Apply decay to all pheromones and remove depleted ones."""
-        for location in list(self.trails.keys()):
-            self.trails[location] = [
-                p for p in self.trails[location]
-                if p.decay(self.decay_rate) > 0.01
-            ]
-            if not self.trails[location]:
-                del self.trails[location]
+    def distance(self, loc1: str, loc2: str) -> float:
+        """Semantic distance between locations (embedding-based)."""
+        emb1 = get_embedding(loc1)
+        emb2 = get_embedding(loc2)
+        return 1 - cosine_similarity(emb1, emb2)
 
-    async def get_strongest_path(self,
-                                  pheromone_type: PheromoneType) -> list[tuple[str, float]]:
-        """Get locations sorted by pheromone intensity."""
-        paths = []
-        for location, pheromones in self.trails.items():
-            for p in pheromones:
-                if p.type == pheromone_type:
-                    paths.append((location, p.intensity))
-        return sorted(paths, key=lambda x: x[1], reverse=True)
+    def prune(self, threshold: float = 0.01):
+        """Remove pheromones below threshold intensity."""
+        self.pheromones = [p for p in self.pheromones if p.decay().intensity > threshold]
+
+    def all(self) -> list[Pheromone]:
+        """Return all pheromones."""
+        return self.pheromones
+
+
+# Alias for backward compatibility
+PheromoneTrail = PheromoneField
+
+
+class DecayStrategies:
+    """Different strategies for pheromone decay."""
+
+    @staticmethod
+    def linear_decay(initial: float, rate: float, age_seconds: float) -> float:
+        """Simple linear decay."""
+        return max(0, initial - (rate * age_seconds))
+
+    @staticmethod
+    def exponential_decay(initial: float, half_life: float,
+                           age_seconds: float) -> float:
+        """Exponential decay with configurable half-life."""
+        return initial * math.exp(-math.log(2) * age_seconds / half_life)
+
+    @staticmethod
+    def threshold_decay(initial: float, threshold_seconds: float,
+                         age_seconds: float) -> float:
+        """No decay until threshold, then linear decay to zero."""
+        if age_seconds < threshold_seconds:
+            return initial
+        else:
+            overage = age_seconds - threshold_seconds
+            return max(0, initial * (1 - overage / threshold_seconds))
 
 
 @dataclass
@@ -277,16 +306,14 @@ class SwarmAgent:
         # Check for danger pheromones
         for task_type in self.capability.task_types:
             location = f"task/{task_type}"
-            danger = await self.pheromone_trail.sense(
-                location, PheromoneType.DANGER
-            )
+            danger = [p for p in self.pheromone_trail.sense(location)
+                     if p.type == PheromoneType.DANGER]
             if danger and danger[0].intensity > 0.7:
                 continue  # Avoid this task type temporarily
 
             # Check success pheromones (exploitation)
-            success = await self.pheromone_trail.sense(
-                location, PheromoneType.SUCCESS
-            )
+            success = [p for p in self.pheromone_trail.sense(location)
+                      if p.type == PheromoneType.VALUE]
 
             # Decide based on exploration vs exploitation
             if random.random() < self._exploration_rate:
@@ -305,11 +332,11 @@ class SwarmAgent:
         location = task.to_location()
 
         # Deposit exploration pheromone
-        await self.pheromone_trail.deposit(Pheromone(
-            type=PheromoneType.EXPLORATION,
+        self.pheromone_trail.deposit(Pheromone(
+            type=PheromoneType.EXPLORED,
             location=location,
             intensity=0.5,
-            agent_id=self.id
+            created_by=self.id
         ))
 
         try:
@@ -317,12 +344,12 @@ class SwarmAgent:
             result = await self._run_with_timeout(task)
 
             # Success: deposit success pheromone
-            await self.pheromone_trail.deposit(Pheromone(
-                type=PheromoneType.SUCCESS,
+            self.pheromone_trail.deposit(Pheromone(
+                type=PheromoneType.VALUE,
                 location=location,
                 intensity=0.8,
-                metadata={"result_summary": str(result)[:100]},
-                agent_id=self.id
+                data={"result_summary": str(result)[:100]},
+                created_by=self.id
             ))
 
             await self.task_pool.complete_task(task.id, result, success=True)
@@ -333,22 +360,22 @@ class SwarmAgent:
 
         except Exception as e:
             # Failure: deposit failure/danger pheromone
-            await self.pheromone_trail.deposit(Pheromone(
-                type=PheromoneType.FAILURE,
+            self.pheromone_trail.deposit(Pheromone(
+                type=PheromoneType.DANGER,
                 location=location,
                 intensity=0.6,
-                metadata={"error": str(e)},
-                agent_id=self.id
+                data={"error": str(e)},
+                created_by=self.id
             ))
 
             if task.attempts >= task.max_attempts - 1:
                 # Repeated failures: mark as danger
-                await self.pheromone_trail.deposit(Pheromone(
+                self.pheromone_trail.deposit(Pheromone(
                     type=PheromoneType.DANGER,
                     location=location,
                     intensity=0.9,
-                    metadata={"reason": "repeated_failures"},
-                    agent_id=self.id
+                    data={"reason": "repeated_failures"},
+                    created_by=self.id
                 ))
 
             await self.task_pool.complete_task(task.id, str(e), success=False)
@@ -377,17 +404,26 @@ class SwarmAgent:
 
     async def request_assistance(self, task: SwarmTask, reason: str):
         """Broadcast assistance request via pheromones."""
-        await self.pheromone_trail.deposit(Pheromone(
-            type=PheromoneType.ASSISTANCE,
+        self.pheromone_trail.deposit(Pheromone(
+            type=PheromoneType.QUESTION,
             location=task.to_location(),
             intensity=0.9,
-            metadata={
+            data={
                 "requesting_agent": self.id,
                 "reason": reason,
                 "task_payload": task.payload
             },
-            agent_id=self.id
+            created_by=self.id
         ))
+
+    async def get_task_context(self, task: SwarmTask) -> dict:
+        """Get context about a task for handoff."""
+        return {
+            "task_id": task.id,
+            "task_type": task.type,
+            "payload": task.payload,
+            "attempts": task.attempts
+        }
 
 
 class Swarm:
@@ -400,7 +436,8 @@ class Swarm:
                  decay_rate: float = 0.05,
                  enable_queen: bool = True):
         self.task_pool = TaskPool()
-        self.pheromone_trail = PheromoneTrail(decay_rate)
+        self.pheromone_trail = PheromoneField()
+        self.decay_rate = decay_rate
         self.agents: dict[str, SwarmAgent] = {}
         self.enable_queen = enable_queen
         self._running = False
@@ -471,22 +508,22 @@ class Swarm:
 
             if pending > len(self.agents) * 2:
                 # Too many pending tasks: signal resource need
-                await self.pheromone_trail.deposit(Pheromone(
-                    type=PheromoneType.RESOURCE,
+                self.pheromone_trail.deposit(Pheromone(
+                    type=PheromoneType.VALUE,
                     location="swarm/capacity",
                     intensity=0.9,
-                    metadata={"pending_count": pending}
+                    data={"pending_count": pending}
                 ))
 
             # Check for assistance requests
-            assistance_trails = await self.pheromone_trail.get_strongest_path(
-                PheromoneType.ASSISTANCE
+            assistance_pheromones = self.pheromone_trail.sense_type(
+                PheromoneType.QUESTION
             )
 
-            for location, intensity in assistance_trails[:3]:
-                if intensity > 0.7:
+            for p in assistance_pheromones[:3]:
+                if p.intensity > 0.7:
                     # Boost priority of tasks needing assistance
-                    task_id = location.split("/")[-1]
+                    task_id = p.location.split("/")[-1]
                     if task_id in self.task_pool.tasks:
                         self.task_pool.tasks[task_id].priority = min(
                             1.0,
@@ -533,7 +570,7 @@ class Swarm:
             },
             "task_pool": await self.task_pool.get_stats(),
             "pheromone_summary": {
-                ptype.value: len(await self.pheromone_trail.get_strongest_path(ptype))
+                ptype.value: len(self.pheromone_trail.sense_type(ptype))
                 for ptype in PheromoneType
             }
         }
@@ -543,52 +580,165 @@ class Swarm:
 # Specialized Swarm Patterns
 # =============================================================================
 
-class HandoffSwarm(Swarm):
-    """
-    Swarm with explicit handoff capabilities between agents.
-    Based on OpenAI Swarm's handoff pattern.
-    """
+class HeterogeneousSwarm(Swarm):
+    """Swarm with different agent types working together."""
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.handoff_registry: dict[str, list[str]] = {}  # agent_id -> can_handoff_to
+        self.agent_types = {}
 
-    def register_handoff(self, from_agent: str, to_agents: list[str]):
-        """Register valid handoff paths."""
-        self.handoff_registry[from_agent] = to_agents
+    def add_agent_type(self, type_name: str,
+                        capability: AgentCapability, count: int):
+        """Add a type of agent to the swarm."""
+        self.agent_types[type_name] = capability
 
-    async def handoff(self,
-                      task: SwarmTask,
-                      from_agent: str,
-                      to_agent: str,
-                      context: dict) -> bool:
-        """
-        Handoff a task from one agent to another.
-        Returns True if handoff was successful.
-        """
-        # Validate handoff
-        if from_agent not in self.handoff_registry:
+        for i in range(count):
+            agent_id = f"{type_name}_{i}"
+            self.add_agent(agent_id, capability, self._create_handler(capability))
+
+    def _create_handler(self, capability: AgentCapability) -> Callable:
+        """Create a default handler for the capability."""
+        async def handler(task: SwarmTask):
+            await asyncio.sleep(random.uniform(0.5, 2.0))
+            return {"task_id": task.id, "type": task.type}
+        return handler
+
+    def rebalance(self, type_counts: dict[str, int]):
+        """Adjust the number of each agent type."""
+        for type_name, target_count in type_counts.items():
+            current = sum(1 for a in self.agents.values()
+                         if a.id.startswith(type_name))
+
+            if current < target_count:
+                # Add agents
+                for i in range(target_count - current):
+                    self.add_agent(
+                        f"{type_name}_{current + i}",
+                        self.agent_types[type_name],
+                        self._create_handler(self.agent_types[type_name])
+                    )
+            elif current > target_count:
+                # Remove agents (let them terminate naturally)
+                to_remove = [a for a in self.agents.values()
+                            if a.id.startswith(type_name)][:current - target_count]
+                for agent in to_remove:
+                    asyncio.create_task(agent.stop())
+
+
+class HierarchicalSwarm(Swarm):
+    """Swarm with scouts, workers, and supervisors."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.scouts = []    # Explore new areas
+        self.workers = []   # Exploit known areas
+        self.supervisors = []  # Coordinate and report
+
+    async def _queen_loop(self):
+        """Supervisor coordination (not command)."""
+        while self._running:
+            await asyncio.sleep(10)
+
+            # Analyze pheromone patterns
+            patterns = await self._analyze_patterns()
+
+            # Adjust swarm composition
+            if patterns["unexplored_ratio"] > 0.5:
+                # Lots unexplored - need more scouts
+                await self._promote_to_scout()
+            elif patterns["high_value_unexploited"]:
+                # Good areas not being worked - need more workers
+                await self._promote_to_worker()
+
+            # Generate summary for observability
+            await self._emit_summary(patterns)
+
+    async def _analyze_patterns(self) -> dict:
+        """Analyze pheromone patterns for decision making."""
+        value_pheromones = self.pheromone_trail.sense_type(PheromoneType.VALUE)
+        explored_pheromones = self.pheromone_trail.sense_type(PheromoneType.EXPLORED)
+
+        total = len(value_pheromones) + len(explored_pheromones)
+        unexplored_ratio = 1.0 - (len(explored_pheromones) / max(1, total))
+
+        high_value = [p for p in value_pheromones if p.intensity > 0.7]
+        high_value_unexploited = len(high_value) > len(self.workers)
+
+        return {
+            "unexplored_ratio": unexplored_ratio,
+            "high_value_unexploited": high_value_unexploited,
+            "total_pheromones": total
+        }
+
+    async def _promote_to_scout(self):
+        """Promote a worker to scout role."""
+        if self.workers:
+            agent = self.workers.pop()
+            self.scouts.append(agent)
+
+    async def _promote_to_worker(self):
+        """Promote a scout to worker role."""
+        if self.scouts:
+            agent = self.scouts.pop()
+            self.workers.append(agent)
+
+    async def _emit_summary(self, patterns: dict):
+        """Emit summary for observability."""
+        pass  # Implement logging/metrics as needed
+
+
+class HandoffSwarm(Swarm):
+    """Swarm where agents hand off tasks to specialists."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.handoff_rules = {}  # from_type -> [to_types]
+
+    def register_handoff_rule(self, from_type: str, to_types: list[str]):
+        """Define which agent types can hand off to which others."""
+        self.handoff_rules[from_type] = to_types
+
+    async def request_handoff(
+        self,
+        from_agent: SwarmAgent,
+        task: SwarmTask,
+        reason: str
+    ) -> bool:
+        """Request handoff to a more suitable agent."""
+
+        # Determine best recipient
+        agent_type = from_agent.id.split("_")[0]
+        possible_recipients = self.handoff_rules.get(agent_type, [])
+
+        if not possible_recipients:
             return False
-        if to_agent not in self.handoff_registry[from_agent]:
-            return False
-        if to_agent not in self.agents:
-            return False
 
-        # Update task with context
-        task.payload["handoff_context"] = context
-        task.payload["handoff_from"] = from_agent
-        task.assigned_agent = None
-        task.status = "pending"
+        # Find available agent of preferred type
+        for recipient_type in possible_recipients:
+            for agent in self.agents.values():
+                if (agent.id.startswith(recipient_type) and
+                    len(agent.current_tasks) < agent.capability.max_concurrent):
 
-        # Deposit pheromone trail for handoff
-        await self.pheromone_trail.deposit(Pheromone(
-            type=PheromoneType.RESOURCE,
-            location=f"handoff/{to_agent}",
-            intensity=0.9,
-            metadata={"task_id": task.id, "from": from_agent}
-        ))
+                    # Execute handoff
+                    task.payload["handoff_context"] = {
+                        "from_agent": from_agent.id,
+                        "reason": reason,
+                        "prior_work": await from_agent.get_task_context(task)
+                    }
 
-        return True
+                    # Leave pheromone trail
+                    self.pheromone_trail.deposit(Pheromone(
+                        type=PheromoneType.RESOURCE,
+                        location=f"handoff/{agent.id}",
+                        intensity=0.8,
+                        data={"task_id": task.id}
+                    ))
+
+                    # Release and reclaim
+                    await self.task_pool.release_task(task.id)
+                    return True
+
+        return False
 
 
 class SpecializationSwarm(Swarm):
@@ -643,6 +793,260 @@ class SpecializationSwarm(Swarm):
                     best_agent = agent_id
 
         return best_agent
+
+
+# =============================================================================
+# Pheromone Strategies (from Chapter 7)
+# =============================================================================
+
+class PheromoneStrategies:
+    """Pheromone-based decision strategies for swarm agents."""
+
+    @staticmethod
+    def choose_direction(pheromones: list[Pheromone]) -> str:
+        """Choose direction based on pheromone attraction."""
+        value_pheromones = [p for p in pheromones if p.type == PheromoneType.VALUE]
+
+        if not value_pheromones:
+            return ""  # Caller should use random_direction()
+
+        # Probabilistic selection weighted by intensity
+        total = sum(p.intensity for p in value_pheromones)
+        r = random.random() * total
+
+        cumulative = 0
+        for p in value_pheromones:
+            cumulative += p.intensity
+            if cumulative >= r:
+                return p.location
+
+        return value_pheromones[-1].location
+
+    @staticmethod
+    def filter_options(options: list[str],
+                       pheromones: list[Pheromone]) -> list[str]:
+        """Remove options with strong negative signals."""
+        danger_locations = {
+            p.location for p in pheromones
+            if p.type == PheromoneType.DANGER and p.intensity > 0.5
+        }
+
+        return [o for o in options if o not in danger_locations]
+
+    @staticmethod
+    def reinforce_path(environment, agent_id: str, path: list[str], success_level: float):
+        """Strengthen pheromones along a successful path."""
+        for location in path:
+            nearby = environment.pheromones.sense(location, radius=0.1)
+            existing = next((p for p in nearby if p.type == PheromoneType.VALUE), None)
+            if existing:
+                # Increase intensity
+                existing.intensity = min(1.0, existing.intensity + success_level * 0.2)
+            else:
+                # Create new pheromone
+                environment.pheromones.deposit(Pheromone(
+                    type=PheromoneType.VALUE,
+                    location=location,
+                    intensity=success_level * 0.5,
+                    created_by=agent_id
+                ))
+
+
+async def evaporation_loop(swarm: Swarm, rate: float = 0.1):
+    """Background task that decays all pheromones."""
+    while swarm._running:
+        for pheromone in swarm.pheromone_trail.all():
+            pheromone.intensity *= (1 - rate)
+
+        # Remove faded pheromones
+        swarm.pheromone_trail.prune(threshold=0.01)
+
+        await asyncio.sleep(10)  # Every 10 seconds
+
+
+# =============================================================================
+# Exploration Strategy (from Chapter 7)
+# =============================================================================
+
+class ExplorationStrategy:
+    """Manages the exploration/exploitation tradeoff."""
+
+    def __init__(
+        self,
+        base_exploration_rate: float = 0.2,
+        success_adjustment: float = 0.02,
+        failure_adjustment: float = 0.05
+    ):
+        self.base_rate = base_exploration_rate
+        self.success_adjustment = success_adjustment
+        self.failure_adjustment = failure_adjustment
+        self.current_rate = base_exploration_rate
+
+    def should_explore(self) -> bool:
+        """Decide whether to explore or exploit."""
+        return random.random() < self.current_rate
+
+    def record_success(self):
+        """Decrease exploration after success (exploitation is working)."""
+        self.current_rate = max(0.05, self.current_rate - self.success_adjustment)
+
+    def record_failure(self):
+        """Increase exploration after failure (need new approaches)."""
+        self.current_rate = min(0.5, self.current_rate + self.failure_adjustment)
+
+    def choose_action(self, pheromone_signals: list[Pheromone],
+                       options: list[str]) -> str:
+        """Choose an action based on exploration/exploitation."""
+
+        if self.should_explore():
+            # Explore: choose randomly, potentially ignoring pheromones
+            return random.choice(options)
+        else:
+            # Exploit: follow strongest positive signal
+            if pheromone_signals:
+                best = max(pheromone_signals, key=lambda p: p.intensity)
+                return best.location
+            else:
+                return random.choice(options)
+
+
+# =============================================================================
+# Observability and Control (from Chapter 7)
+# =============================================================================
+
+@dataclass
+class AgentState:
+    """State of a single agent."""
+    current_location: str
+    energy: float
+    current_task: Optional[str]
+    exploration_rate: float
+
+
+@dataclass
+class SwarmSnapshot:
+    """Snapshot of swarm state at a point in time."""
+    timestamp: float
+    agent_states: dict[str, AgentState]
+    pheromone_field: dict
+    task_distribution: dict
+    convergence_metrics: dict
+
+
+class SwarmObserver:
+    """Observes and reports on swarm state."""
+
+    def __init__(self, swarm: Swarm):
+        self.swarm = swarm
+
+    async def get_state_snapshot(self) -> SwarmSnapshot:
+        """Capture current swarm state."""
+        return SwarmSnapshot(
+            timestamp=time.time(),
+            agent_states={
+                agent_id: AgentState(
+                    current_location=getattr(agent, 'current_location', ''),
+                    energy=getattr(agent, 'energy', 1.0),
+                    current_task=(agent.current_tasks[0].id
+                                  if agent.current_tasks else None),
+                    exploration_rate=agent._exploration_rate
+                )
+                for agent_id, agent in self.swarm.agents.items()
+            },
+            pheromone_field=await self._snapshot_pheromones(),
+            task_distribution=await self._snapshot_tasks(),
+            convergence_metrics=await self._calculate_convergence()
+        )
+
+    async def _snapshot_pheromones(self) -> dict:
+        """Snapshot pheromone field state."""
+        return {
+            ptype.value: [
+                {"location": p.location, "intensity": p.intensity}
+                for p in self.swarm.pheromone_trail.sense_type(ptype)
+            ]
+            for ptype in PheromoneType
+        }
+
+    async def _snapshot_tasks(self) -> dict:
+        """Snapshot task distribution."""
+        return await self.swarm.task_pool.get_stats()
+
+    async def _calculate_convergence(self) -> dict:
+        """Measure how converged the swarm is."""
+        value_pheromones = self.swarm.pheromone_trail.sense_type(PheromoneType.VALUE)
+
+        if not value_pheromones:
+            return {"converged": False, "concentration": 0.0}
+
+        # Calculate concentration (Gini coefficient of intensities)
+        intensities = [p.intensity for p in value_pheromones]
+        total = sum(intensities)
+
+        if total == 0:
+            return {"converged": False, "concentration": 0.0}
+
+        normalized = [i/total for i in sorted(intensities)]
+        n = len(normalized)
+        cumulative = sum((i+1) * v for i, v in enumerate(normalized))
+        gini = (2 * cumulative) / (n * sum(normalized)) - (n + 1) / n
+
+        return {
+            "converged": gini > 0.7,
+            "concentration": gini,
+            "top_location": value_pheromones[0].location if value_pheromones else None,
+            "top_intensity": value_pheromones[0].intensity if value_pheromones else 0
+        }
+
+
+class SwarmController:
+    """Provides control mechanisms for swarm behavior."""
+
+    def __init__(self, swarm: Swarm):
+        self.swarm = swarm
+
+    async def boost_area(self, location: str, intensity: float = 0.9):
+        """Artificially boost interest in an area."""
+        self.swarm.pheromone_trail.deposit(Pheromone(
+            type=PheromoneType.VALUE,
+            location=location,
+            intensity=intensity,
+            data={"source": "controller_boost"}
+        ))
+
+    async def block_area(self, location: str):
+        """Prevent agents from exploring an area."""
+        self.swarm.pheromone_trail.deposit(Pheromone(
+            type=PheromoneType.DANGER,
+            location=location,
+            intensity=1.0,
+            data={"source": "controller_block"}
+        ))
+
+    async def inject_task(self, task: SwarmTask, priority_boost: float = 0.3):
+        """Inject a high-priority task."""
+        task.priority = min(1.0, task.priority + priority_boost)
+        await self.swarm.submit_task(task)
+
+        # Attract agents to this task
+        await self.boost_area(task.to_location(), 0.8)
+
+    async def reset_exploration(self):
+        """Reset all agents to exploration mode."""
+        for agent in self.swarm.agents.values():
+            agent._exploration_rate = 0.5
+
+    async def force_convergence(self, target_location: str):
+        """Force swarm to converge on a location."""
+        # Block all other high-value areas
+        value_pheromones = self.swarm.pheromone_trail.sense_type(PheromoneType.VALUE)
+
+        for p in value_pheromones:
+            if p.location != target_location:
+                await self.block_area(p.location)
+
+        # Boost target
+        await self.boost_area(target_location, 1.0)
 
 
 # =============================================================================

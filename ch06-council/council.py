@@ -14,6 +14,8 @@ Use this pattern when single-agent decisions aren't trustworthy enough.
 
 import asyncio
 import json
+import logging
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Literal
 from dataclasses import dataclass, field
@@ -21,17 +23,22 @@ from enum import Enum
 import uuid
 from anthropic import AsyncAnthropic
 
+# Configure logging for audit trail
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("council")
+
 
 # =============================================================================
 # Council Configuration
 # =============================================================================
 
-class VotingMethod(str, Enum):
+class VotingMechanism(str, Enum):
     """Methods for reaching council decisions"""
-    UNANIMOUS = "unanimous"      # All must agree
-    MAJORITY = "majority"        # >50% must agree
-    SUPERMAJORITY = "supermajority"  # >66% must agree
-    CONSENSUS = "consensus"      # Iterative refinement until agreement
+    MAJORITY = "majority"           # Simple majority wins
+    SUPERMAJORITY = "supermajority" # 2/3 or 3/4 required
+    UNANIMOUS = "unanimous"         # All must agree
+    RANKED = "ranked"               # Ranked choice voting
+    WEIGHTED = "weighted"           # Some votes count more
 
 
 class ExpertiseArea(str, Enum):
@@ -44,12 +51,39 @@ class ExpertiseArea(str, Enum):
     OPERATIONS = "operations"
 
 
+# =============================================================================
+# Councilor Dataclass (from book)
+# =============================================================================
+
+@dataclass
+class Councilor:
+    """
+    Councilor definition as shown in the book.
+    Each councilor has a distinct perspective defined by their system prompt.
+    """
+    id: str
+    name: str
+    perspective: str
+    expertise: list[str]
+    system_prompt: str
+
+    def create_agent(self, llm_client) -> "CouncilMember":
+        """Create an agent from this councilor definition."""
+        return CouncilMember(
+            member_id=self.id,
+            name=self.name,
+            expertise=ExpertiseArea.TECHNICAL,  # Default, can be overridden
+            persona=self.system_prompt,
+            mock_mode=False
+        )
+
+
 @dataclass
 class CouncilConfig:
     """Configuration for a council"""
     name: str
     description: str
-    voting_method: VotingMethod = VotingMethod.MAJORITY
+    voting_method: VotingMechanism = VotingMechanism.MAJORITY
     max_deliberation_rounds: int = 3
     min_confidence_threshold: float = 0.7
     require_human_for_deadlock: bool = True
@@ -114,6 +148,28 @@ class Vote:
     vote: Literal["approve", "reject", "abstain"]
     reasoning: str
     timestamp: str
+    choice: str = ""  # For compatibility with book's tally methods
+
+
+@dataclass
+class RankedVote:
+    """A ranked choice vote for multiple options"""
+    member_id: str
+    rankings: dict[str, int]  # option -> rank (1 = first choice)
+    timestamp: str
+
+
+@dataclass
+class VoteResult:
+    """Result of a vote tally"""
+    winner: str
+    vote_count: int
+    total_votes: int
+    margin: float = 0.0
+    unanimous: bool = False
+    dissents: list[str] = field(default_factory=list)
+    weighted_score: float = 0.0
+    weights_used: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -141,6 +197,70 @@ class CouncilDecision:
 
 
 # =============================================================================
+# Deliberation State Management (from book)
+# =============================================================================
+
+@dataclass
+class TranscriptEntry:
+    """Entry in the deliberation transcript"""
+    phase: str
+    speaker: str
+    content: str
+
+
+@dataclass
+class ConsensusResult:
+    """Result of a consensus check"""
+    consensus: str  # "yes", "no", "partial"
+    confidence: str  # "high", "medium", "low"
+    analysis: str
+
+
+@dataclass
+class Position:
+    """A councilor's position in a round"""
+    round: int
+    content: str
+    confidence: float
+
+
+@dataclass
+class DeliberationState:
+    """Tracks the state of an ongoing deliberation."""
+    question: str
+    context: dict
+    current_round: int = 0
+    proposals: dict[str, list[Proposal]] = field(default_factory=dict)
+    critiques: dict[str, list[Critique]] = field(default_factory=dict)
+    transcript: list[TranscriptEntry] = field(default_factory=list)
+    consensus_checks: list[ConsensusResult] = field(default_factory=list)
+
+    def get_active_proposals(self) -> list[Proposal]:
+        """Get proposals from the current round."""
+        return self.proposals.get(str(self.current_round), [])
+
+    def get_full_transcript(self) -> str:
+        """Format the complete deliberation transcript."""
+        lines = []
+        for entry in self.transcript:
+            lines.append(f"[{entry.phase}] {entry.speaker}: {entry.content}")
+        return "\n\n".join(lines)
+
+    def get_councilor_evolution(self, councilor_id: str) -> list[Position]:
+        """Track how a councilor's position evolved across rounds."""
+        positions = []
+        for round_num, proposals in sorted(self.proposals.items()):
+            for proposal in proposals:
+                if proposal.member_id == councilor_id:
+                    positions.append(Position(
+                        round=int(round_num),
+                        content=proposal.content,
+                        confidence=proposal.confidence
+                    ))
+        return positions
+
+
+# =============================================================================
 # Council Member Agent
 # =============================================================================
 
@@ -160,18 +280,30 @@ class CouncilMember:
         name: str,
         expertise: ExpertiseArea,
         persona: str,
-        model: str = "claude-sonnet-4-20250514"
+        model: str = "claude-sonnet-4-20250514",
+        mock_mode: bool = False
     ):
         self.member_id = member_id
         self.name = name
         self.expertise = expertise
         self.persona = persona
         self.model = model
-        self.client = AsyncAnthropic()
+        self.mock_mode = mock_mode
+        self.client = None
+        if not mock_mode:
+            import os
+            if not os.environ.get("ANTHROPIC_API_KEY"):
+                raise ValueError(
+                    "ANTHROPIC_API_KEY not set. Either:\n"
+                    "  1. Set the environment variable: export ANTHROPIC_API_KEY=your-key\n"
+                    "  2. Use mock_mode=True for testing without API calls"
+                )
+            self.client = AsyncAnthropic()
 
     async def close(self):
         """Close the client connection to prevent resource leaks."""
-        await self.client.close()
+        if self.client:
+            await self.client.close()
 
     async def propose(
         self,
@@ -207,23 +339,36 @@ Respond in JSON format:
             for p in previous_proposals:
                 user_content += f"- {p.member_id}: {p.content}\n"
 
-        response = await self.client.messages.create(
-            model=self.model,
-            max_tokens=1024,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_content}]
-        )
-
-        # Parse response
-        try:
-            result = json.loads(response.content[0].text)
-        except json.JSONDecodeError:
+        # Mock mode for testing without API
+        if self.mock_mode:
             result = {
-                "proposal": response.content[0].text,
-                "reasoning": "Unable to parse structured response",
-                "confidence": 0.5,
-                "supporting_evidence": []
+                "proposal": f"[Mock] {self.name} proposes a balanced approach to: {question[:50]}...",
+                "reasoning": f"As a {self.expertise.value} expert, I recommend careful evaluation.",
+                "confidence": 0.75,
+                "supporting_evidence": ["Mock evidence 1", "Mock evidence 2"]
             }
+        else:
+            response = await self.client.messages.create(
+                model=self.model,
+                max_tokens=1024,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_content}]
+            )
+
+            # Parse response
+            try:
+                result = json.loads(response.content[0].text)
+            except json.JSONDecodeError as e:
+                logger.warning(
+                    f"Failed to parse proposal JSON from {self.member_id}: {e}. "
+                    f"Raw response: {response.content[0].text[:200]}..."
+                )
+                result = {
+                    "proposal": response.content[0].text,
+                    "reasoning": "Unable to parse structured response",
+                    "confidence": 0.5,
+                    "supporting_evidence": []
+                }
 
         return Proposal(
             id=f"prop_{uuid.uuid4().hex[:8]}",
@@ -272,21 +417,32 @@ Confidence: {proposal.confidence}
 
 Context: {json.dumps(context)}"""
 
-        response = await self.client.messages.create(
-            model=self.model,
-            max_tokens=1024,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_content}]
-        )
-
-        try:
-            result = json.loads(response.content[0].text)
-        except json.JSONDecodeError:
+        # Mock mode for testing without API
+        if self.mock_mode:
             result = {
-                "assessment": "neutral",
-                "concerns": ["Unable to parse structured critique"],
-                "suggestions": []
+                "assessment": "support",
+                "concerns": [f"[Mock] Consider {self.expertise.value} implications"],
+                "suggestions": ["[Mock] Further analysis recommended"]
             }
+        else:
+            response = await self.client.messages.create(
+                model=self.model,
+                max_tokens=1024,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_content}]
+            )
+
+            try:
+                result = json.loads(response.content[0].text)
+            except json.JSONDecodeError as e:
+                logger.warning(
+                    f"Failed to parse critique JSON from {self.member_id}: {e}"
+                )
+                result = {
+                    "assessment": "neutral",
+                    "concerns": ["Unable to parse structured critique"],
+                    "suggestions": []
+                }
 
         return Critique(
             id=f"crit_{uuid.uuid4().hex[:8]}",
@@ -330,17 +486,24 @@ Proposal:
 Critiques:
 {critiques_text}"""
 
-        response = await self.client.messages.create(
-            model=self.model,
-            max_tokens=512,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_content}]
-        )
+        # Mock mode for testing without API
+        if self.mock_mode:
+            result = {"vote": "approve", "reasoning": f"[Mock] {self.name} approves after review"}
+        else:
+            response = await self.client.messages.create(
+                model=self.model,
+                max_tokens=512,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_content}]
+            )
 
-        try:
-            result = json.loads(response.content[0].text)
-        except json.JSONDecodeError:
-            result = {"vote": "abstain", "reasoning": "Unable to parse vote"}
+            try:
+                result = json.loads(response.content[0].text)
+            except json.JSONDecodeError as e:
+                logger.warning(
+                    f"Failed to parse vote JSON from {self.member_id}: {e}"
+                )
+                result = {"vote": "abstain", "reasoning": "Unable to parse vote"}
 
         return Vote(
             member_id=self.member_id,
@@ -574,14 +737,14 @@ class Council:
 
         total_voters = len(self.members) - 1  # Exclude proposer
 
-        if self.config.voting_method == VotingMethod.UNANIMOUS:
+        if self.config.voting_method == VotingMechanism.UNANIMOUS:
             for proposal in proposals:
                 counts = vote_counts[proposal.id]
                 if counts["approve"] == total_voters:
                     return proposal
             return None
 
-        elif self.config.voting_method == VotingMethod.MAJORITY:
+        elif self.config.voting_method == VotingMechanism.MAJORITY:
             threshold = total_voters / 2
             best_proposal = None
             best_approval = 0
@@ -594,7 +757,7 @@ class Council:
 
             return best_proposal
 
-        elif self.config.voting_method == VotingMethod.SUPERMAJORITY:
+        elif self.config.voting_method == VotingMechanism.SUPERMAJORITY:
             threshold = total_voters * 0.66
 
             for proposal in proposals:
@@ -604,12 +767,89 @@ class Council:
 
             return None
 
+        elif self.config.voting_method == VotingMechanism.RANKED:
+            # Use ranked choice voting
+            # Convert vote_counts to ranked votes format for tally_ranked_choice
+            ranked_votes = self._convert_to_ranked_votes(proposals, vote_counts)
+            result = self.tally_ranked_choice(ranked_votes)
+            for proposal in proposals:
+                if proposal.id == result.winner:
+                    return proposal
+            return None
+
         else:  # CONSENSUS - return highest approval
             best_proposal = max(
                 proposals,
                 key=lambda p: vote_counts[p.id]["approve"]
             )
             return best_proposal
+
+    def _convert_to_ranked_votes(
+        self, proposals: list[Proposal], vote_counts: dict[str, dict]
+    ) -> dict[str, RankedVote]:
+        """Convert approval-based votes to ranked votes for ranked choice voting."""
+        # Create synthetic ranked votes based on approval counts
+        ranked_votes = {}
+        for member in self.members:
+            # Rank proposals by approval count (higher approval = lower rank number)
+            sorted_proposals = sorted(
+                proposals,
+                key=lambda p: vote_counts[p.id]["approve"],
+                reverse=True
+            )
+            rankings = {p.id: i + 1 for i, p in enumerate(sorted_proposals)}
+            ranked_votes[member.member_id] = RankedVote(
+                member_id=member.member_id,
+                rankings=rankings,
+                timestamp=datetime.now(timezone.utc).isoformat()
+            )
+        return ranked_votes
+
+    def tally_majority(self, votes: dict[str, Vote]) -> VoteResult:
+        """Simple majority tally."""
+        counts = Counter(v.choice for v in votes.values())
+        winner, count = counts.most_common(1)[0]
+        total = len(votes)
+
+        return VoteResult(
+            winner=winner,
+            vote_count=count,
+            total_votes=total,
+            margin=count / total,
+            unanimous=(count == total),
+            dissents=[cid for cid, v in votes.items() if v.choice != winner]
+        )
+
+    def tally_ranked_choice(self, votes: dict[str, RankedVote]) -> VoteResult:
+        """Instant runoff ranked choice voting."""
+        remaining_options = set(votes[list(votes.keys())[0]].rankings.keys())
+        total = 0
+
+        while len(remaining_options) > 1:
+            # Count first-choice votes for remaining options
+            first_choices = Counter()
+            for vote in votes.values():
+                for choice in vote.rankings:
+                    if choice in remaining_options:
+                        first_choices[choice] += 1
+                        break
+
+            # Check for majority
+            total = sum(first_choices.values())
+            for option, count in first_choices.items():
+                if count > total / 2:
+                    return VoteResult(winner=option, vote_count=count, total_votes=total)
+
+            # Eliminate last place (tie-break: alphabetically first)
+            min_count = first_choices.most_common()[-1][1]
+            tied_last = [
+                opt for opt, cnt in first_choices.items() if cnt == min_count
+            ]
+            last_place = sorted(tied_last)[0]
+            remaining_options.remove(last_place)
+
+        winner = remaining_options.pop()
+        return VoteResult(winner=winner, vote_count=0, total_votes=total)
 
     def _check_human_approval_required(
         self,
@@ -684,12 +924,16 @@ class Council:
 # Pre-built Council Configurations
 # =============================================================================
 
-def create_technical_council() -> Council:
-    """Create a council for technical decisions"""
+def create_technical_council(mock_mode: bool = False) -> Council:
+    """Create a council for technical decisions.
+
+    Args:
+        mock_mode: If True, use simulated responses (no API key required)
+    """
     config = CouncilConfig(
         name="Technical Review Council",
         description="Reviews technical decisions and architecture changes",
-        voting_method=VotingMethod.MAJORITY,
+        voting_method=VotingMechanism.MAJORITY,
         max_deliberation_rounds=2,
         require_human_above_impact="high"
     )
@@ -699,31 +943,38 @@ def create_technical_council() -> Council:
             member_id="architect",
             name="Alex Architect",
             expertise=ExpertiseArea.TECHNICAL,
-            persona="Senior software architect focused on scalability and maintainability"
+            persona="Senior software architect focused on scalability and maintainability",
+            mock_mode=mock_mode
         ),
         CouncilMember(
             member_id="security",
             name="Sam Security",
             expertise=ExpertiseArea.SECURITY,
-            persona="Security engineer focused on threat modeling and secure design"
+            persona="Security engineer focused on threat modeling and secure design",
+            mock_mode=mock_mode
         ),
         CouncilMember(
             member_id="ops",
             name="Olivia Ops",
             expertise=ExpertiseArea.OPERATIONS,
-            persona="SRE focused on reliability, observability, and operational excellence"
+            persona="SRE focused on reliability, observability, and operational excellence",
+            mock_mode=mock_mode
         )
     ]
 
     return Council(config, members)
 
 
-def create_business_council() -> Council:
-    """Create a council for business decisions"""
+def create_business_council(mock_mode: bool = False) -> Council:
+    """Create a council for business decisions.
+
+    Args:
+        mock_mode: If True, use simulated responses (no API key required)
+    """
     config = CouncilConfig(
         name="Business Decision Council",
         description="Reviews business-critical decisions",
-        voting_method=VotingMethod.SUPERMAJORITY,
+        voting_method=VotingMechanism.SUPERMAJORITY,
         max_deliberation_rounds=3,
         require_human_above_impact="medium"
     )
@@ -733,20 +984,133 @@ def create_business_council() -> Council:
             member_id="business",
             name="Blake Business",
             expertise=ExpertiseArea.BUSINESS,
-            persona="Business strategist focused on ROI and market impact"
+            persona="Business strategist focused on ROI and market impact",
+            mock_mode=mock_mode
         ),
         CouncilMember(
             member_id="legal",
             name="Leslie Legal",
             expertise=ExpertiseArea.LEGAL,
-            persona="Legal counsel focused on compliance and risk mitigation"
+            persona="Legal counsel focused on compliance and risk mitigation",
+            mock_mode=mock_mode
         ),
         CouncilMember(
             member_id="ethics",
             name="Evan Ethics",
             expertise=ExpertiseArea.ETHICS,
-            persona="Ethics advisor focused on fairness and responsible AI"
+            persona="Ethics advisor focused on fairness and responsible AI",
+            mock_mode=mock_mode
         )
+    ]
+
+    return Council(config, members)
+
+
+# =============================================================================
+# Example Councilors from Book
+# =============================================================================
+
+# Example councilors as defined in the book chapter
+BOOK_COUNCILORS = [
+    Councilor(
+        id="customer_advocate",
+        name="Customer Advocate",
+        perspective="Prioritizes user experience and customer value",
+        expertise=["UX", "customer feedback", "market needs"],
+        system_prompt="""You are the Customer Advocate on a product council.
+
+Your role is to represent customer interests in all decisions. You:
+- Argue for features that solve real customer problems
+- Push back on complexity that hurts usability
+- Cite customer feedback and research
+- Consider diverse user segments
+
+You are NOT a pushover. Advocate strongly for customers."""
+    ),
+    Councilor(
+        id="tech_realist",
+        name="Technical Realist",
+        perspective="Focuses on implementation feasibility and technical debt",
+        expertise=["engineering", "architecture", "scalability"],
+        system_prompt="""You are the Technical Realist on a product council.
+
+Your role is to ground discussions in technical reality. You:
+- Assess implementation complexity honestly
+- Warn about technical debt and maintenance burden
+- Propose technically sound alternatives
+- Consider security and performance implications
+
+You're realistic, not pessimistic. Support good ideas, flag genuine concerns."""
+    ),
+    Councilor(
+        id="business_strategist",
+        name="Business Strategist",
+        perspective="Considers market position and business impact",
+        expertise=["strategy", "competition", "revenue"],
+        system_prompt="""You are the Business Strategist on a product council.
+
+Your role is to ensure decisions align with business goals. You:
+- Consider competitive positioning
+- Evaluate revenue and cost implications
+- Think about market timing
+- Balance short-term and long-term value
+
+Good business requires happy customers and sustainable engineering."""
+    ),
+]
+
+
+# Security councilor example from book
+SECURITY_COUNCILOR = Councilor(
+    id="security_reviewer",
+    name="Security Analyst",
+    perspective="security-first evaluation",
+    expertise=["threat modeling", "secure architecture", "compliance"],
+    system_prompt="""You are the Security Analyst on this council.
+
+Your job is to identify and advocate for security considerations. You:
+- Assume attackers are sophisticated and persistent
+- Identify attack surfaces in every proposal
+- Require specific mitigations, not vague assurances
+- Consider both technical and human factors
+- Reference relevant compliance requirements
+
+You are NOT paranoid or obstructionist. Security enables business by making risk
+visible and manageable. Support proposals that address your concerns adequately.
+
+When critiquing, always propose specific improvements rather than just rejecting.
+When approving, clearly state what security properties you verified.
+
+Your recommendations should be proportional to the actual risk level."""
+)
+
+
+def create_product_council(mock_mode: bool = False) -> Council:
+    """Create a product council using the book's example councilors.
+
+    This demonstrates the councilor definitions from the book chapter.
+
+    Args:
+        mock_mode: If True, use simulated responses (no API key required)
+    """
+    config = CouncilConfig(
+        name="Product Council",
+        description="Reviews product feature decisions",
+        voting_method=VotingMechanism.MAJORITY,
+        max_deliberation_rounds=3,
+        require_human_above_impact="high"
+    )
+
+    # Create members from book councilors
+    members = [
+        CouncilMember(
+            member_id=c.id,
+            name=c.name,
+            expertise=ExpertiseArea.BUSINESS,  # Default for product decisions
+            persona=c.system_prompt,
+            mock_mode=mock_mode
+        )
+        for c in BOOK_COUNCILORS
     ]
 
     return Council(config, members)
