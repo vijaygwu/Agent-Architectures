@@ -21,7 +21,7 @@ import jwt
 import logging
 import aiohttp
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from secrets import token_urlsafe
 from typing import Any
@@ -58,8 +58,8 @@ class SimpleTokenAuth:
         self.tokens[token_hash] = AgentToken(
             agent_id=agent_id,
             token=token_hash,
-            created_at=datetime.utcnow(),
-            expires_at=datetime.utcnow() + timedelta(hours=ttl_hours)
+            created_at=datetime.now(timezone.utc),
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=ttl_hours)
         )
 
         return token  # Return unhashed token to agent
@@ -72,7 +72,7 @@ class SimpleTokenAuth:
         if not agent_token:
             return None
 
-        if agent_token.expires_at and agent_token.expires_at < datetime.utcnow():
+        if agent_token.expires_at and agent_token.expires_at < datetime.now(timezone.utc):
             return None
 
         return agent_token.agent_id
@@ -109,8 +109,8 @@ class ScopedAuth:
             agent_id=agent_id,
             token_hash=token_hash,
             scopes=scopes,
-            created_at=datetime.utcnow(),
-            expires_at=datetime.utcnow() + timedelta(hours=24)
+            created_at=datetime.now(timezone.utc),
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=24)
         )
 
         return token
@@ -123,7 +123,7 @@ class ScopedAuth:
         if not agent_token:
             return False
 
-        if agent_token.expires_at and agent_token.expires_at < datetime.utcnow():
+        if agent_token.expires_at and agent_token.expires_at < datetime.now(timezone.utc):
             return False
 
         return required_scope in agent_token.scopes
@@ -141,7 +141,7 @@ class JWTAuth:
     def create_token(self, agent_id: str, scopes: list[str],
                       ttl_hours: int = 24) -> str:
         """Create a JWT for an agent."""
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         payload = {
             "sub": agent_id,  # Subject (agent ID)
             "scopes": scopes,
@@ -206,7 +206,7 @@ class AsymmetricJWTAuth:
     def create_token(self, agent_id: str, scopes: list[str],
                       ttl_hours: int = 24) -> str:
         """Create a JWT signed with private key."""
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         payload = {
             "sub": agent_id,
             "scopes": scopes,
@@ -248,7 +248,7 @@ class Identity:
     type: IdentityType
     name: str
     parent_id: str | None = None  # For hierarchical relationships
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     metadata: dict = field(default_factory=dict)
 
 
@@ -270,7 +270,7 @@ class AgentIdentity:
     role: AgentRole
     scopes: set[str]  # Fine-grained permissions (e.g., "data:read")
     metadata: dict = field(default_factory=dict)
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def to_claims(self) -> dict:
         return {
@@ -385,7 +385,7 @@ class IdentityService:
             logger.warning(f"Token issuance failed: agent {agent_id} not found")
             return None
 
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         token_id = token_urlsafe(16)
 
         payload = {
@@ -570,7 +570,7 @@ class TokenManager:
             payload = self.service.verify_token(self.current_token)
             if payload:
                 exp = datetime.fromtimestamp(payload["exp"])
-                if exp - datetime.utcnow() > self.refresh_threshold:
+                if exp - datetime.now(timezone.utc) > self.refresh_threshold:
                     return self.current_token
 
         # Need new token
@@ -622,7 +622,7 @@ class AuditLog:
             outcome: str, details: dict = None):
         """Log an agent action."""
         entry = AuditEntry(
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(timezone.utc),
             agent_id=agent_id,
             action=action,
             resource=resource,
@@ -825,7 +825,7 @@ class DelegationGrant:
     expires_at: datetime
 
     def is_valid(self) -> bool:
-        return datetime.utcnow() < self.expires_at
+        return datetime.now(timezone.utc) < self.expires_at
 
     def can_use_scope(self, scope: str) -> bool:
         return scope in self.scopes and self.is_valid()
@@ -859,7 +859,7 @@ class DelegationService:
             delegate=delegate_id,
             scopes=granted_scopes,
             constraints=constraints or {},
-            expires_at=datetime.utcnow() + timedelta(hours=ttl_hours)
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=ttl_hours)
         )
 
         grant_id = f"grant_{token_urlsafe(8)}"
@@ -972,7 +972,7 @@ class CredentialRotator:
     async def ensure_fresh(self, agent_id: str) -> str:
         """Ensure agent has a fresh token."""
         last = self.last_rotation.get(agent_id)
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
 
         if not last or (now - last) > self.interval:
             # Revoke old tokens

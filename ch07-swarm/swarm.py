@@ -14,7 +14,7 @@ import random
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from itertools import cycle
 from typing import Any, Callable, Optional
@@ -60,12 +60,12 @@ class Pheromone:
     location: str             # Where in the problem space
     intensity: float          # 0.0 to 1.0
     data: dict = field(default_factory=dict)
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     created_by: str = ""
 
     def decay(self, rate: float = 0.1) -> "Pheromone":
         """Pheromones weaken over time."""
-        age_seconds = (datetime.utcnow() - self.created_at).total_seconds()
+        age_seconds = (datetime.now(timezone.utc) - self.created_at).total_seconds()
         decay_factor = max(0, 1 - (rate * age_seconds / 3600))
         return Pheromone(
             type=self.type,
@@ -79,7 +79,7 @@ class Pheromone:
     def reinforce(self, amount: float = 0.2):
         """Reinforce pheromone when path is used again."""
         self.intensity = min(1.0, self.intensity + amount)
-        self.created_at = datetime.utcnow()
+        self.created_at = datetime.now(timezone.utc)
 
 
 class PheromoneField:

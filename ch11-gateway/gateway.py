@@ -20,7 +20,7 @@ import json
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from secrets import token_urlsafe
 from typing import Any, Callable
@@ -126,7 +126,7 @@ class RateLimitPolicy:
     def check(self, context: dict) -> tuple[bool, dict]:
         """Check if request is within rate limit."""
         key = self._get_key(context)
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         window_start = now - timedelta(seconds=self.window_seconds)
 
         # Clean old requests
@@ -241,7 +241,7 @@ class BudgetPolicy:
         # Reset if period expired
         if self._period_expired(key):
             self.usage[key] = 0
-            self.period_start[key] = datetime.utcnow()
+            self.period_start[key] = datetime.now(timezone.utc)
 
         current = self.usage[key]
         if current + amount > self.max_amount:
@@ -268,7 +268,7 @@ class BudgetPolicy:
             return True
 
         start = self.period_start[key]
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
 
         if self.period == "request":
             return True
@@ -405,7 +405,7 @@ class PolicyGateway:
             "action": request.get("action"),
             "resource": request.get("resource"),
             "type": request.get("type"),
-            "timestamp": datetime.utcnow(),
+            "timestamp": datetime.now(timezone.utc),
             "request": request
         }
 
@@ -443,7 +443,7 @@ class PolicyEnforcedAgent:
             "resource": resource,
             "content": content,
             "estimated_cost": self._estimate_cost(action, content),
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": datetime.now(timezone.utc).isoformat()
         }
 
         # Evaluate policies
@@ -519,7 +519,7 @@ class ApprovalRequest:
     reason: str  # Why approval is needed
     policy_id: str
     status: ApprovalStatus = ApprovalStatus.PENDING
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     expires_at: datetime = None
     decided_by: str = None
     decided_at: datetime = None
@@ -557,7 +557,7 @@ class ApprovalWorkflow:
             content=content,
             reason=reason,
             policy_id=policy_id,
-            expires_at=datetime.utcnow() + timedelta(hours=timeout)
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=timeout)
         )
 
         self.pending[request_id] = request
@@ -581,7 +581,7 @@ class ApprovalWorkflow:
                 raise ValueError(f"Unknown request: {request_id}")
 
             # Check expiration
-            if datetime.utcnow() > request.expires_at:
+            if datetime.now(timezone.utc) > request.expires_at:
                 request.status = ApprovalStatus.EXPIRED
                 return request
 
@@ -597,7 +597,7 @@ class ApprovalWorkflow:
         if request and request.status == ApprovalStatus.PENDING:
             request.status = ApprovalStatus.APPROVED
             request.decided_by = approver
-            request.decided_at = datetime.utcnow()
+            request.decided_at = datetime.now(timezone.utc)
             request.decision_reason = reason
 
     def deny(self, request_id: str, approver: str, reason: str):
@@ -606,7 +606,7 @@ class ApprovalWorkflow:
         if request and request.status == ApprovalStatus.PENDING:
             request.status = ApprovalStatus.DENIED
             request.decided_by = approver
-            request.decided_at = datetime.utcnow()
+            request.decided_at = datetime.now(timezone.utc)
             request.decision_reason = reason
 
 
