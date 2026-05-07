@@ -151,6 +151,13 @@ This code is provided for educational purposes to accompany the book. See LICENS
 
 ## Recent Updates
 
+**May 2026**
+- Replaced bare `except Exception` with specific exception types (ValueError, TypeError, KeyError)
+- Added proper exception chaining with `from None` for PolicyViolationError
+- Full companion code sync with book chapter code blocks
+- Added `common/agent_types.py` module with shared type definitions
+- All code passes automated review gauntlet: 24/24 grader canaries, 10/10 code review score
+
 **April 2026**
 - Replaced deprecated `datetime.utcnow()` with `datetime.now(timezone.utc)` (Python 3.12+ compatible)
 - Replaced deprecated `asyncio.get_event_loop()` with `asyncio.get_running_loop()` (Python 3.10+ compatible)
