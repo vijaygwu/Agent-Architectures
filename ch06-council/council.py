@@ -21,11 +21,54 @@ from typing import Any, Literal
 from dataclasses import dataclass, field
 from enum import Enum
 import uuid
-from anthropic import AsyncAnthropic
 
-# Configure logging for audit trail
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("council")
+try:
+    from anthropic import AsyncAnthropic, APIError, APITimeoutError
+    ANTHROPIC_AVAILABLE = True
+except ImportError:
+    ANTHROPIC_AVAILABLE = False
+    AsyncAnthropic = None
+    APIError = Exception
+    APITimeoutError = Exception
+
+# Import common utilities for structured logging and retry
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent / "common"))
+try:
+    from utils import configure_logging, with_retry, get_tracer
+    logger = configure_logging(level="INFO", json_output=True, logger_name="council")
+    tracer = get_tracer("council")
+except ImportError:
+    # No-op tracer fallback
+    class _NoOpSpan:
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def set_attribute(self, k, v): pass
+        def add_event(self, n, a=None): pass
+    class _NoOpTracer:
+        def start_as_current_span(self, n, **kw): return _NoOpSpan()
+    tracer = _NoOpTracer()
+    # Fallback to basic logging if utils not available
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger("council")
+
+    # Define a simple retry decorator fallback (matching utils.py signature)
+    def with_retry(max_attempts=3, base_delay=1.0, max_delay=30.0, exponential_base=2.0, retryable_exceptions=(Exception,)):
+        def decorator(func):
+            async def wrapper(*args, **kw):
+                last_error = None
+                for attempt in range(max_attempts):
+                    try:
+                        return await func(*args, **kw)
+                    except retryable_exceptions as e:
+                        last_error = e
+                        if attempt < max_attempts - 1:
+                            delay = min(base_delay * (exponential_base ** attempt), max_delay)
+                            await asyncio.sleep(delay)
+                raise last_error
+            return wrapper
+        return decorator
 
 
 # =============================================================================
@@ -69,10 +112,24 @@ class Councilor:
 
     def create_agent(self, llm_client) -> "CouncilMember":
         """Create an agent from this councilor definition."""
+        # Map expertise from list to enum
+        expertise_map = {
+            "security": ExpertiseArea.SECURITY,
+            "technical": ExpertiseArea.TECHNICAL,
+            "business": ExpertiseArea.BUSINESS,
+            "legal": ExpertiseArea.LEGAL,
+            "ethics": ExpertiseArea.ETHICS,
+            "operations": ExpertiseArea.OPERATIONS,
+        }
+        expertise = ExpertiseArea.TECHNICAL
+        for exp in self.expertise:
+            if exp.lower() in expertise_map:
+                expertise = expertise_map[exp.lower()]
+                break
         return CouncilMember(
             member_id=self.id,
             name=self.name,
-            expertise=ExpertiseArea.TECHNICAL,  # Default, can be overridden
+            expertise=expertise,
             persona=self.system_prompt,
             mock_mode=False
         )
@@ -148,7 +205,7 @@ class Vote:
     vote: Literal["approve", "reject", "abstain"]
     reasoning: str
     timestamp: str
-    choice: str = ""  # For compatibility with book's tally methods
+    choice: str = ""  # Populated in vote() for tally compatibility
 
 
 @dataclass
@@ -280,7 +337,7 @@ class CouncilMember:
         name: str,
         expertise: ExpertiseArea,
         persona: str,
-        model: str = "claude-sonnet-4-20250514",
+        model: str = "claude-sonnet-4",
         mock_mode: bool = False
     ):
         self.member_id = member_id
@@ -292,6 +349,11 @@ class CouncilMember:
         self.client = None
         if not mock_mode:
             import os
+            if not ANTHROPIC_AVAILABLE:
+                raise ImportError(
+                    "anthropic library required. Install with: pip install anthropic\n"
+                    "Or use mock_mode=True for testing without API calls"
+                )
             if not os.environ.get("ANTHROPIC_API_KEY"):
                 raise ValueError(
                     "ANTHROPIC_API_KEY not set. Either:\n"
@@ -305,6 +367,44 @@ class CouncilMember:
         if self.client:
             await self.client.close()
 
+    @with_retry(max_attempts=3, base_delay=1.0, retryable_exceptions=(asyncio.TimeoutError, APIError, APITimeoutError))
+    async def _call_llm(
+        self,
+        system_prompt: str,
+        user_content: str,
+        operation_name: str
+    ) -> str:
+        """
+        Make an LLM API call with retry logic and timeout.
+
+        Args:
+            system_prompt: The system prompt for the LLM
+            user_content: The user message content
+            operation_name: Name of the operation (for error messages)
+
+        Returns:
+            The raw text response from the LLM
+        """
+        try:
+            response = await asyncio.wait_for(
+                self.client.messages.create(
+                    model=self.model,
+                    max_tokens=1024,
+                    system=system_prompt,
+                    messages=[{"role": "user", "content": user_content}]
+                ),
+                timeout=60.0
+            )
+            return response.content[0].text
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"LLM timeout in {operation_name}",
+                extra={"extra_fields": {"member_id": self.member_id, "operation": operation_name}}
+            )
+            raise TimeoutError(
+                f"LLM API call timed out after 60 seconds in {operation_name} for {self.member_id}"
+            )
+
     async def propose(
         self,
         question: str,
@@ -317,7 +417,12 @@ class CouncilMember:
         If previous proposals exist (in later rounds), consider them
         when formulating the response.
         """
-        system_prompt = f"""You are {self.name}, a council member with expertise in {self.expertise.value}.
+        with tracer.start_as_current_span(f"council.propose.{self.member_id}") as span:
+            span.set_attribute("member.id", self.member_id)
+            span.set_attribute("member.expertise", self.expertise.value)
+            span.set_attribute("has_previous_proposals", previous_proposals is not None)
+
+            system_prompt = f"""You are {self.name}, a council member with expertise in {self.expertise.value}.
 
 Your persona: {self.persona}
 
@@ -332,53 +437,53 @@ Respond in JSON format:
     "supporting_evidence": ["evidence1", "evidence2"]
 }}"""
 
-        user_content = f"Question for deliberation: {question}\n\nContext: {json.dumps(context)}"
+            user_content = f"Question for deliberation: {question}\n\nContext: {json.dumps(context)}"
 
-        if previous_proposals:
-            user_content += "\n\nPrevious proposals from other members:\n"
-            for p in previous_proposals:
-                user_content += f"- {p.member_id}: {p.content}\n"
+            if previous_proposals:
+                user_content += "\n\nPrevious proposals from other members:\n"
+                for p in previous_proposals:
+                    user_content += f"- {p.member_id}: {p.content}\n"
 
-        # Mock mode for testing without API
-        if self.mock_mode:
-            result = {
-                "proposal": f"[Mock] {self.name} proposes a balanced approach to: {question[:50]}...",
-                "reasoning": f"As a {self.expertise.value} expert, I recommend careful evaluation.",
-                "confidence": 0.75,
-                "supporting_evidence": ["Mock evidence 1", "Mock evidence 2"]
-            }
-        else:
-            response = await self.client.messages.create(
-                model=self.model,
-                max_tokens=1024,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_content}]
-            )
-
-            # Parse response
-            try:
-                result = json.loads(response.content[0].text)
-            except json.JSONDecodeError as e:
-                logger.warning(
-                    f"Failed to parse proposal JSON from {self.member_id}: {e}. "
-                    f"Raw response: {response.content[0].text[:200]}..."
-                )
+            # Mock mode for testing without API
+            if self.mock_mode:
                 result = {
-                    "proposal": response.content[0].text,
-                    "reasoning": "Unable to parse structured response",
-                    "confidence": 0.5,
-                    "supporting_evidence": []
+                    "proposal": f"[Mock] {self.name} proposes a balanced approach to: {question[:50]}...",
+                    "reasoning": f"As a {self.expertise.value} expert, I recommend careful evaluation.",
+                    "confidence": 0.75,
+                    "supporting_evidence": ["Mock evidence 1", "Mock evidence 2"]
                 }
+            else:
+                # Use retry-wrapped LLM call
+                response_text = await self._call_llm(system_prompt, user_content, "propose")
 
-        return Proposal(
-            id=f"prop_{uuid.uuid4().hex[:8]}",
-            member_id=self.member_id,
-            content=result.get("proposal", ""),
-            reasoning=result.get("reasoning", ""),
-            confidence=result.get("confidence", 0.5),
-            timestamp=datetime.now(timezone.utc).isoformat(),
-            supporting_evidence=result.get("supporting_evidence", [])
-        )
+                # Parse response
+                try:
+                    result = json.loads(response_text)
+                except json.JSONDecodeError as e:
+                    logger.warning(
+                        f"Failed to parse proposal JSON from {self.member_id}",
+                        extra={"extra_fields": {"error": str(e), "response_preview": response_text[:200]}}
+                    )
+                    result = {
+                        "proposal": response_text,
+                        "reasoning": "Unable to parse structured response",
+                        "confidence": 0.5,
+                        "supporting_evidence": []
+                    }
+
+            # Create Proposal from result (works for both mock and real modes)
+            proposal = Proposal(
+                id=f"prop_{uuid.uuid4().hex[:8]}",
+                member_id=self.member_id,
+                content=result.get("proposal", ""),
+                reasoning=result.get("reasoning", ""),
+                confidence=result.get("confidence", 0.5),
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                supporting_evidence=result.get("supporting_evidence", [])
+            )
+            span.set_attribute("proposal.id", proposal.id)
+            span.set_attribute("proposal.confidence", proposal.confidence)
+            return proposal
 
     async def critique(
         self,
@@ -391,7 +496,12 @@ Respond in JSON format:
 
         Provide assessment, concerns, and constructive suggestions.
         """
-        system_prompt = f"""You are {self.name}, a council member with expertise in {self.expertise.value}.
+        with tracer.start_as_current_span(f"council.critique.{self.member_id}") as span:
+            span.set_attribute("member.id", self.member_id)
+            span.set_attribute("target.proposal_id", proposal.id)
+            span.set_attribute("target.member_id", proposal.member_id)
+
+            system_prompt = f"""You are {self.name}, a council member with expertise in {self.expertise.value}.
 
 Your persona: {self.persona}
 
@@ -405,7 +515,7 @@ Respond in JSON format:
     "suggestions": ["suggestion1", "suggestion2"]
 }}"""
 
-        user_content = f"""Question: {question}
+            user_content = f"""Question: {question}
 
 Proposal from {proposal.member_id}:
 {proposal.content}
@@ -417,42 +527,43 @@ Confidence: {proposal.confidence}
 
 Context: {json.dumps(context)}"""
 
-        # Mock mode for testing without API
-        if self.mock_mode:
-            result = {
-                "assessment": "support",
-                "concerns": [f"[Mock] Consider {self.expertise.value} implications"],
-                "suggestions": ["[Mock] Further analysis recommended"]
-            }
-        else:
-            response = await self.client.messages.create(
-                model=self.model,
-                max_tokens=1024,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_content}]
-            )
-
-            try:
-                result = json.loads(response.content[0].text)
-            except json.JSONDecodeError as e:
-                logger.warning(
-                    f"Failed to parse critique JSON from {self.member_id}: {e}"
-                )
+            # Mock mode for testing without API
+            if self.mock_mode:
                 result = {
-                    "assessment": "neutral",
-                    "concerns": ["Unable to parse structured critique"],
-                    "suggestions": []
+                    "assessment": "support",
+                    "concerns": [f"[Mock] Consider {self.expertise.value} implications"],
+                    "suggestions": ["[Mock] Further analysis recommended"]
                 }
+            else:
+                # Use retry-wrapped LLM call
+                response_text = await self._call_llm(system_prompt, user_content, "critique")
 
-        return Critique(
-            id=f"crit_{uuid.uuid4().hex[:8]}",
-            member_id=self.member_id,
-            target_proposal_id=proposal.id,
-            assessment=result.get("assessment", "neutral"),
-            concerns=result.get("concerns", []),
-            suggestions=result.get("suggestions", []),
-            timestamp=datetime.now(timezone.utc).isoformat()
-        )
+                try:
+                    result = json.loads(response_text)
+                except json.JSONDecodeError as e:
+                    logger.warning(
+                        f"Failed to parse critique JSON from {self.member_id}",
+                        extra={"extra_fields": {"error": str(e)}}
+                    )
+                    result = {
+                        "assessment": "neutral",
+                        "concerns": ["Unable to parse structured critique"],
+                        "suggestions": []
+                    }
+
+            # Create Critique from result (works for both mock and real modes)
+            critique = Critique(
+                id=f"crit_{uuid.uuid4().hex[:8]}",
+                member_id=self.member_id,
+                target_proposal_id=proposal.id,
+                assessment=result.get("assessment", "neutral"),
+                concerns=result.get("concerns", []),
+                suggestions=result.get("suggestions", []),
+                timestamp=datetime.now(timezone.utc).isoformat()
+            )
+            span.set_attribute("critique.id", critique.id)
+            span.set_attribute("critique.assessment", critique.assessment)
+            return critique
 
     async def vote(
         self,
@@ -463,7 +574,12 @@ Context: {json.dumps(context)}"""
         """
         Vote on a proposal after reviewing all critiques.
         """
-        system_prompt = f"""You are {self.name}, a council member with expertise in {self.expertise.value}.
+        with tracer.start_as_current_span(f"council.vote.{self.member_id}") as span:
+            span.set_attribute("member.id", self.member_id)
+            span.set_attribute("proposal.id", proposal.id)
+            span.set_attribute("critiques.count", len(critiques))
+
+            system_prompt = f"""You are {self.name}, a council member with expertise in {self.expertise.value}.
 
 Based on the proposal and all critiques, cast your vote.
 
@@ -473,12 +589,12 @@ Respond in JSON format:
     "reasoning": "Brief explanation for your vote"
 }}"""
 
-        critiques_text = "\n".join([
-            f"- {c.member_id} ({c.assessment}): {c.concerns}"
-            for c in critiques
-        ])
+            critiques_text = "\n".join([
+                f"- {c.member_id} ({c.assessment}): {c.concerns}"
+                for c in critiques
+            ])
 
-        user_content = f"""Question: {question}
+            user_content = f"""Question: {question}
 
 Proposal:
 {proposal.content}
@@ -486,32 +602,34 @@ Proposal:
 Critiques:
 {critiques_text}"""
 
-        # Mock mode for testing without API
-        if self.mock_mode:
-            result = {"vote": "approve", "reasoning": f"[Mock] {self.name} approves after review"}
-        else:
-            response = await self.client.messages.create(
-                model=self.model,
-                max_tokens=512,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_content}]
+            # Mock mode for testing without API
+            if self.mock_mode:
+                result = {"vote": "approve", "reasoning": f"[Mock] {self.name} approves after review"}
+            else:
+                # Use retry-wrapped LLM call
+                response_text = await self._call_llm(system_prompt, user_content, "vote")
+
+                try:
+                    result = json.loads(response_text)
+                except json.JSONDecodeError as e:
+                    logger.warning(
+                        f"Failed to parse vote JSON from {self.member_id}",
+                        extra={"extra_fields": {"error": str(e)}}
+                    )
+                    result = {"vote": "abstain", "reasoning": "Unable to parse vote"}
+
+            # Create Vote from result (works for both mock and real modes)
+            vote_value = result.get("vote", "abstain")
+            vote_obj = Vote(
+                member_id=self.member_id,
+                proposal_id=proposal.id,
+                vote=vote_value,
+                reasoning=result.get("reasoning", ""),
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                choice=vote_value
             )
-
-            try:
-                result = json.loads(response.content[0].text)
-            except json.JSONDecodeError as e:
-                logger.warning(
-                    f"Failed to parse vote JSON from {self.member_id}: {e}"
-                )
-                result = {"vote": "abstain", "reasoning": "Unable to parse vote"}
-
-        return Vote(
-            member_id=self.member_id,
-            proposal_id=proposal.id,
-            vote=result.get("vote", "abstain"),
-            reasoning=result.get("reasoning", ""),
-            timestamp=datetime.now(timezone.utc).isoformat()
-        )
+            span.set_attribute("vote.value", vote_value)
+            return vote_obj
 
 
 # =============================================================================
@@ -527,6 +645,10 @@ class Council:
     2. Members critique each other's proposals
     3. Voting occurs based on configured method
     4. If no consensus, iterate or escalate
+
+    Usage:
+        async with Council(config, members) as council:
+            decision = await council.deliberate(question, context)
     """
 
     def __init__(
@@ -571,49 +693,60 @@ class Council:
         decision_id = f"decision_{uuid.uuid4().hex[:8]}"
         self.deliberation_log = []
 
-        for round_num in range(self.config.max_deliberation_rounds):
-            round_result = await self._run_deliberation_round(
-                round_num + 1,
-                question,
-                context
+        with tracer.start_as_current_span(f"council.deliberate.{decision_id}") as span:
+            span.set_attribute("decision.id", decision_id)
+            span.set_attribute("impact_level", impact_level)
+            span.set_attribute("members.count", len(self.members))
+
+            for round_num in range(self.config.max_deliberation_rounds):
+                span.add_event(f"round.{round_num + 1}.start")
+                round_result = await self._run_deliberation_round(
+                    round_num + 1,
+                    question,
+                    context
+                )
+                self.deliberation_log.append(round_result)
+
+                # Check for consensus
+                if round_result.outcome == "consensus":
+                    span.set_attribute("outcome", "consensus")
+                    break
+                elif round_result.outcome == "deadlock":
+                    if self.config.require_human_for_deadlock:
+                        span.set_attribute("outcome", "escalated")
+                        return self._create_escalation_decision(
+                            decision_id, question, "Deadlock after deliberation"
+                        )
+
+            # Final voting
+            winning_proposal, voting_result = await self._final_vote(question)
+
+            # Check if human approval required
+            requires_human = self._check_human_approval_required(
+                impact_level,
+                voting_result
             )
-            self.deliberation_log.append(round_result)
 
-            # Check for consensus
-            if round_result.outcome == "consensus":
-                break
-            elif round_result.outcome == "deadlock":
-                if self.config.require_human_for_deadlock:
-                    return self._create_escalation_decision(
-                        decision_id, question, "Deadlock after deliberation"
-                    )
+            # Collect dissenting opinions
+            dissenting = self._collect_dissenting_opinions(
+                winning_proposal,
+                self.deliberation_log[-1].critiques
+            )
 
-        # Final voting
-        winning_proposal, voting_result = await self._final_vote(question)
+            span.set_attribute("rounds.total", len(self.deliberation_log))
+            span.set_attribute("requires_human_approval", requires_human)
 
-        # Check if human approval required
-        requires_human = self._check_human_approval_required(
-            impact_level,
-            voting_result
-        )
-
-        # Collect dissenting opinions
-        dissenting = self._collect_dissenting_opinions(
-            winning_proposal,
-            self.deliberation_log[-1].critiques
-        )
-
-        return CouncilDecision(
-            decision_id=decision_id,
-            question=question,
-            decision=winning_proposal.content if winning_proposal else "No consensus reached",
-            confidence=winning_proposal.confidence if winning_proposal else 0.0,
-            voting_result=voting_result,
-            deliberation_rounds=self.deliberation_log,
-            dissenting_opinions=dissenting,
-            requires_human_approval=requires_human,
-            timestamp=datetime.now(timezone.utc).isoformat()
-        )
+            return CouncilDecision(
+                decision_id=decision_id,
+                question=question,
+                decision=winning_proposal.content if winning_proposal else "No consensus reached",
+                confidence=winning_proposal.confidence if winning_proposal else 0.0,
+                voting_result=voting_result,
+                deliberation_rounds=self.deliberation_log,
+                dissenting_opinions=dissenting,
+                requires_human_approval=requires_human,
+                timestamp=datetime.now(timezone.utc).isoformat()
+            )
 
     async def _run_deliberation_round(
         self,
@@ -849,7 +982,7 @@ class Council:
             remaining_options.remove(last_place)
 
         winner = remaining_options.pop()
-        return VoteResult(winner=winner, vote_count=0, total_votes=total)
+        return VoteResult(winner=winner, vote_count=len(votes), total_votes=len(votes))
 
     def _check_human_approval_required(
         self,
@@ -1123,8 +1256,8 @@ def create_product_council(mock_mode: bool = False) -> Council:
 async def main():
     """Demonstrate council deliberation"""
 
-    # Create technical council with context manager to ensure cleanup
-    council = create_technical_council()
+    # Create technical council with mock mode for demo (no API key needed)
+    council = create_technical_council(mock_mode=True)
 
     # Question for deliberation
     question = """

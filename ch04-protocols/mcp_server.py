@@ -16,20 +16,23 @@ from datetime import datetime, timezone
 from typing import Any, Sequence
 from dataclasses import dataclass, asdict
 
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
-from mcp.types import (
-    Tool,
-    TextContent,
-    ImageContent,
-    EmbeddedResource,
-    LoggingLevel,
-    Resource,
-    ResourceTemplate,
-    Prompt,
-    PromptMessage,
-    PromptArgument,
-)
+try:
+    from mcp.server import Server
+    from mcp.server.stdio import stdio_server
+    from mcp.types import (
+        Tool,
+        TextContent,
+        Resource,
+        Prompt,
+        PromptMessage,
+        PromptArgument,
+    )
+    MCP_AVAILABLE = True
+except ImportError:
+    MCP_AVAILABLE = False
+    Server = None
+    stdio_server = None
+    Tool = TextContent = Resource = Prompt = PromptMessage = PromptArgument = None
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -176,11 +179,28 @@ class ProcurementDatabase:
 # Initialize database
 db = ProcurementDatabase()
 
-# Create MCP server
-server = Server("procurement-mcp-server")
+# Create MCP server (only if MCP is available)
+if MCP_AVAILABLE:
+    server = Server("procurement-mcp-server")
+else:
+    server = None
+    # Define no-op decorator for when MCP is unavailable
+    def _noop_decorator(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
 
 
-@server.list_tools()
+# Use conditional decorator
+_list_tools = server.list_tools if MCP_AVAILABLE else _noop_decorator
+_call_tool = server.call_tool if MCP_AVAILABLE else _noop_decorator
+_list_resources = server.list_resources if MCP_AVAILABLE else _noop_decorator
+_read_resource = server.read_resource if MCP_AVAILABLE else _noop_decorator
+_list_prompts = server.list_prompts if MCP_AVAILABLE else _noop_decorator
+_get_prompt = server.get_prompt if MCP_AVAILABLE else _noop_decorator
+
+
+@_list_tools()
 async def list_tools() -> list[Tool]:
     """
     List all available tools.
@@ -299,7 +319,7 @@ async def list_tools() -> list[Tool]:
     ]
 
 
-@server.call_tool()
+@_call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextContent]:
     """
     Handle tool invocations.
@@ -450,7 +470,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
         )]
 
 
-@server.list_resources()
+@_list_resources()
 async def list_resources() -> list[Resource]:
     """
     List available resources.
@@ -474,7 +494,7 @@ async def list_resources() -> list[Resource]:
     ]
 
 
-@server.read_resource()
+@_read_resource()
 async def read_resource(uri: str) -> str:
     """Read resource content by URI"""
 
@@ -503,7 +523,7 @@ async def read_resource(uri: str) -> str:
     raise ValueError(f"Unknown resource: {uri}")
 
 
-@server.list_prompts()
+@_list_prompts()
 async def list_prompts() -> list[Prompt]:
     """
     List available prompt templates.
@@ -542,7 +562,7 @@ async def list_prompts() -> list[Prompt]:
     ]
 
 
-@server.get_prompt()
+@_get_prompt()
 async def get_prompt(name: str, arguments: dict[str, str] | None) -> list[PromptMessage]:
     """Get a prompt template with filled arguments"""
 
@@ -598,6 +618,9 @@ Please guide me through:
 
 async def main():
     """Run the MCP server using stdio transport"""
+    if not MCP_AVAILABLE:
+        raise ImportError("MCP library required. Install with: pip install mcp")
+
     logger.info("Starting Procurement MCP Server")
 
     async with stdio_server() as (read_stream, write_stream):

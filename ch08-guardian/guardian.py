@@ -11,6 +11,12 @@ The guardian pattern provides:
 
 Reference: Deutsche Telekom case study - 95% resolution time improvement
 with guardian agents validating network changes before deployment.
+
+Production Notes:
+- Deploy guardians as separate services for fault isolation
+- Use centralized policy management for consistent enforcement
+- Implement guardian health monitoring with automatic failover
+- Store audit logs in append-only storage for compliance
 """
 
 import asyncio
@@ -19,7 +25,7 @@ import json
 import logging
 import re
 from abc import ABC, abstractmethod
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
 from enum import Enum
@@ -28,6 +34,15 @@ from typing import Any, Callable
 # Configure logging for audit trail
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("guardian")
+
+
+# =============================================================================
+# Exceptions
+# =============================================================================
+
+class ValidationError(Exception):
+    """Raised when guardian validation fails."""
+    pass
 
 
 # =============================================================================
@@ -77,10 +92,14 @@ class ActionRequest:
 class Guardian(ABC):
     """Base class for all guardians."""
 
+    # Default max audit log entries to prevent unbounded memory growth
+    DEFAULT_MAX_AUDIT_ENTRIES = 10000
+
     def __init__(self, guardian_id: str, config: dict = None):
         self.id = guardian_id
         self.config = config or {}
-        self.audit_log: list[dict] = []
+        max_entries = self.config.get("max_audit_entries", self.DEFAULT_MAX_AUDIT_ENTRIES)
+        self.audit_log: deque[dict] = deque(maxlen=max_entries)
 
     @abstractmethod
     async def validate(self, action: ActionRequest) -> ValidationResult:
@@ -422,9 +441,18 @@ Respond with JSON:
         ])
 
         try:
-            return json.loads(response.content)
-        except json.JSONDecodeError:
-            return {"safe": True, "issues": []}
+            result = json.loads(response.content)
+            # Validate expected structure
+            if not isinstance(result, dict):
+                raise ValueError("Response is not a dict")
+            result.setdefault("safe", True)
+            result.setdefault("issues", [])
+            result.setdefault("explanation", "")
+            return result
+        except (json.JSONDecodeError, ValueError) as e:
+            # Defensive fallback: assume safe but log the parsing failure
+            logger.warning(f"Content analysis response parsing failed: {type(e).__name__}: {e}")
+            return {"safe": True, "issues": [], "explanation": f"Response parsing failed: {e}"}
 
     async def fix_content(self, content: str, violations: list) -> str | None:
         """Attempt to fix minor content issues."""
@@ -659,7 +687,7 @@ class CostGuardian(Guardian):
         if "model" in action.parameters:
             model_multipliers = {
                 "gpt-4o": 5,
-                "gpt-4-turbo": 5,
+                "gpt-4o-mini": 1,
                 "gpt-3.5-turbo": 1,
                 "claude-opus-4": 10,
                 "claude-sonnet-4": 3,
@@ -911,7 +939,11 @@ class CircuitConfig:
 
 
 class CircuitBreaker:
-    """Circuit breaker for system protection."""
+    """Circuit breaker for system protection.
+
+    Note: For concurrent async environments, wrap state mutations
+    with asyncio.Lock to ensure thread safety.
+    """
 
     def __init__(self, name: str, config: CircuitConfig = None):
         self.name = name
@@ -921,47 +953,51 @@ class CircuitBreaker:
         self.success_count = 0
         self.last_failure_time: datetime | None = None
         self.state_change_callbacks: list[Callable] = []
+        self._lock = asyncio.Lock()  # Thread safety for concurrent access
 
-    def can_execute(self) -> bool:
-        """Check if execution is allowed."""
-        if self.state == CircuitState.CLOSED:
-            return True
+    async def can_execute(self) -> bool:
+        """Check if execution is allowed (async for lock safety)."""
+        async with self._lock:
+            if self.state == CircuitState.CLOSED:
+                return True
 
-        if self.state == CircuitState.OPEN:
-            # Check if timeout has elapsed
-            if self.last_failure_time:
-                elapsed = (datetime.now(timezone.utc) - self.last_failure_time).total_seconds()
-                if elapsed >= self.config.timeout_seconds:
-                    self.transition_to(CircuitState.HALF_OPEN)
-                    return True
+            if self.state == CircuitState.OPEN:
+                # Check if timeout has elapsed
+                if self.last_failure_time:
+                    elapsed = (datetime.now(timezone.utc) - self.last_failure_time).total_seconds()
+                    if elapsed >= self.config.timeout_seconds:
+                        self.transition_to(CircuitState.HALF_OPEN)
+                        return True
+                return False
+
+            if self.state == CircuitState.HALF_OPEN:
+                return True
+
             return False
 
-        if self.state == CircuitState.HALF_OPEN:
-            return True
+    async def record_success(self):
+        """Record a successful execution (async for lock safety)."""
+        async with self._lock:
+            self.failure_count = 0
 
-        return False
+            if self.state == CircuitState.HALF_OPEN:
+                self.success_count += 1
+                if self.success_count >= self.config.success_threshold:
+                    self.transition_to(CircuitState.CLOSED)
 
-    def record_success(self):
-        """Record a successful execution."""
-        self.failure_count = 0
+    async def record_failure(self):
+        """Record a failed execution (async for lock safety)."""
+        async with self._lock:
+            self.failure_count += 1
+            self.last_failure_time = datetime.now(timezone.utc)
+            self.success_count = 0
 
-        if self.state == CircuitState.HALF_OPEN:
-            self.success_count += 1
-            if self.success_count >= self.config.success_threshold:
-                self.transition_to(CircuitState.CLOSED)
+            if self.state == CircuitState.CLOSED:
+                if self.failure_count >= self.config.failure_threshold:
+                    self.transition_to(CircuitState.OPEN)
 
-    def record_failure(self):
-        """Record a failed execution."""
-        self.failure_count += 1
-        self.last_failure_time = datetime.now(timezone.utc)
-        self.success_count = 0
-
-        if self.state == CircuitState.CLOSED:
-            if self.failure_count >= self.config.failure_threshold:
+            elif self.state == CircuitState.HALF_OPEN:
                 self.transition_to(CircuitState.OPEN)
-
-        elif self.state == CircuitState.HALF_OPEN:
-            self.transition_to(CircuitState.OPEN)
 
     def transition_to(self, new_state: CircuitState):
         """Transition to a new state."""
@@ -1001,7 +1037,7 @@ class CircuitBreakerGuardian(Guardian):
     async def validate(self, action: ActionRequest) -> ValidationResult:
         """Check circuit breakers before allowing action."""
         # Check global breaker
-        if not self.global_breaker.can_execute():
+        if not await self.global_breaker.can_execute():
             return ValidationResult(
                 decision=GuardianDecision.DENY,
                 reason="System circuit breaker is open - operations suspended",
@@ -1010,7 +1046,7 @@ class CircuitBreakerGuardian(Guardian):
 
         # Check action-specific breaker
         breaker = self.breakers.get(action.action_type)
-        if breaker and not breaker.can_execute():
+        if breaker and not await breaker.can_execute():
             return ValidationResult(
                 decision=GuardianDecision.DENY,
                 reason=f"Circuit breaker for {action.action_type} is open",
@@ -1023,18 +1059,18 @@ class CircuitBreakerGuardian(Guardian):
             metadata={"circuit_state": self.global_breaker.state.value}
         )
 
-    def record_outcome(self, action: ActionRequest, success: bool):
+    async def record_outcome(self, action: ActionRequest, success: bool):
         """Record execution outcome to update circuit breakers."""
         breaker = self.breakers.get(action.action_type)
 
         if success:
-            self.global_breaker.record_success()
+            await self.global_breaker.record_success()
             if breaker:
-                breaker.record_success()
+                await breaker.record_success()
         else:
-            self.global_breaker.record_failure()
+            await self.global_breaker.record_failure()
             if breaker:
-                breaker.record_failure()
+                await breaker.record_failure()
 
     def emergency_stop(self):
         """Emergency shutdown - open all breakers."""
@@ -1162,14 +1198,19 @@ class ResilientGuardianPipeline(GuardianPipeline):
     def mark_unhealthy(self, guardian_id: str):
         """Mark a guardian as unhealthy."""
         self.guardian_health[guardian_id] = False
-        # Schedule health check
-        asyncio.create_task(self.health_check_later(guardian_id))
+        # Schedule health check, tracking task to avoid warnings
+        if not hasattr(self, '_health_check_tasks'):
+            self._health_check_tasks = []
+        task = asyncio.create_task(self.health_check_later(guardian_id))
+        self._health_check_tasks.append(task)
 
     async def health_check_later(self, guardian_id: str, delay: float = 60.0):
         """Re-enable guardian after delay if healthy."""
         await asyncio.sleep(delay)
 
-        guardian = next(g for g in self.guardians if g.id == guardian_id)
+        guardian = next((g for g in self.guardians if g.id == guardian_id), None)
+        if not guardian:
+            return
 
         # Simple health check action
         test_action = ActionRequest(
@@ -1184,9 +1225,15 @@ class ResilientGuardianPipeline(GuardianPipeline):
                 timeout=2.0
             )
             self.guardian_health[guardian_id] = True
-        except Exception:
-            # Still unhealthy, check again later
-            asyncio.create_task(self.health_check_later(guardian_id, delay * 2))
+        except (asyncio.TimeoutError, asyncio.CancelledError, ValidationError):
+            # Still unhealthy, check again later with tracked task
+            task = asyncio.create_task(self.health_check_later(guardian_id, delay * 2))
+            self._health_check_tasks.append(task)
+        except Exception as e:
+            # Log unexpected errors but don't crash the health check loop
+            logger.warning(f"Unexpected error in health check for {guardian_id}: {e}")
+            task = asyncio.create_task(self.health_check_later(guardian_id, delay * 2))
+            self._health_check_tasks.append(task)
 
     def create_fallback_result(self, reason: str) -> ValidationResult:
         """Create a fallback result when guardian fails."""
@@ -1284,6 +1331,7 @@ class EscalationManager:
         self.notification_service = notification_service
         self.timeout_hours = timeout_hours
         self.pending_actions: dict[str, asyncio.Future] = {}
+        self._timeout_tasks: dict[str, asyncio.Task] = {}
 
     async def escalate(self, action: ActionRequest, guardian_id: str,
                        result: ValidationResult) -> EscalationTicket:
@@ -1306,8 +1354,10 @@ class EscalationManager:
         future = asyncio.get_running_loop().create_future()
         self.pending_actions[ticket.ticket_id] = future
 
-        # Set timeout
-        asyncio.create_task(self.timeout_ticket(ticket.ticket_id))
+        # Set timeout with tracked task reference
+        self._timeout_tasks[ticket.ticket_id] = asyncio.create_task(
+            self.timeout_ticket(ticket.ticket_id)
+        )
 
         return ticket
 

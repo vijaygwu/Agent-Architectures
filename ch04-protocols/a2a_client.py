@@ -9,16 +9,34 @@ This module provides:
 3. Task delegation patterns
 
 Reference: https://github.com/google/A2A
+
+Production Notes:
+- Implement Agent Card caching with TTL-based refresh
+- Add connection pooling for high-throughput agent communication
+- Use circuit breakers for unreachable agent endpoints
+- Consider service mesh integration for mTLS and observability
 """
 
 import asyncio
 import json
+import logging
 import uuid
 import httpx
 from datetime import datetime, timezone
 from typing import Any, Literal
 from dataclasses import dataclass, field, asdict
 from enum import Enum
+
+# Import structured logging
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent / "common"))
+try:
+    from utils import configure_logging
+    logger = configure_logging(level="INFO", json_output=True, logger_name="a2a_client")
+except ImportError:
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger("a2a_client")
 
 
 # =============================================================================
@@ -28,7 +46,7 @@ from enum import Enum
 class TaskState(str, Enum):
     """Task lifecycle states per A2A specification"""
     PENDING = "pending"
-    IN_PROGRESS = "in_progress"
+    WORKING = "working"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -215,8 +233,16 @@ class A2AClient:
         self._known_agents: dict[str, AgentCard] = {}
         self._active_tasks: dict[str, A2ATask] = {}
 
+    async def __aenter__(self):
+        """Support async context manager."""
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Close resources on context exit."""
+        await self.close()
+
     async def close(self):
-        """Close HTTP client"""
+        """Close HTTP client."""
         await self._http_client.aclose()
 
     # -------------------------------------------------------------------------
@@ -234,16 +260,27 @@ class A2AClient:
         well_known_url = f"{endpoint.rstrip('/')}/.well-known/agent.json"
 
         try:
-            response = await self._http_client.get(well_known_url)
+            response = await asyncio.wait_for(
+                self._http_client.get(well_known_url),
+                timeout=30.0
+            )
             if response.status_code == 200:
                 card = AgentCard.from_dict(response.json())
                 self._known_agents[card.name] = card
                 return card
-        except httpx.RequestError:
+        except (httpx.RequestError, asyncio.TimeoutError):
             pass
 
         # Fall back to root endpoint
-        response = await self._http_client.get(endpoint)
+        try:
+            response = await asyncio.wait_for(
+                self._http_client.get(endpoint),
+                timeout=30.0
+            )
+        except asyncio.TimeoutError:
+            raise TimeoutError(
+                f"HTTP request timed out after 30 seconds discovering agent at {endpoint}"
+            )
         response.raise_for_status()
         card = AgentCard.from_dict(response.json())
         self._known_agents[card.name] = card
@@ -264,10 +301,18 @@ class A2AClient:
         if capability:
             params["capability"] = capability
 
-        response = await self._http_client.get(
-            f"{registry_url}/agents",
-            params=params
-        )
+        try:
+            response = await asyncio.wait_for(
+                self._http_client.get(
+                    f"{registry_url}/agents",
+                    params=params
+                ),
+                timeout=30.0
+            )
+        except asyncio.TimeoutError:
+            raise TimeoutError(
+                f"HTTP request timed out after 30 seconds discovering from registry {registry_url}"
+            )
         response.raise_for_status()
 
         agents = []
@@ -336,11 +381,19 @@ class A2AClient:
         )
 
         # Send to target agent
-        response = await self._http_client.post(
-            f"{card.endpoint}/tasks",
-            json=task.to_dict(),
-            headers=await self._get_auth_headers(card)
-        )
+        try:
+            response = await asyncio.wait_for(
+                self._http_client.post(
+                    f"{card.endpoint}/tasks",
+                    json=task.to_dict(),
+                    headers=await self._get_auth_headers(card)
+                ),
+                timeout=30.0
+            )
+        except asyncio.TimeoutError:
+            raise TimeoutError(
+                f"HTTP request timed out after 30 seconds creating task on {card.name}"
+            )
         response.raise_for_status()
 
         # Update task with response
@@ -375,11 +428,19 @@ class A2AClient:
             metadata=metadata or {}
         )
 
-        response = await self._http_client.post(
-            f"{card.endpoint}/tasks/{task_id}/messages",
-            json=msg.to_dict(),
-            headers=await self._get_auth_headers(card)
-        )
+        try:
+            response = await asyncio.wait_for(
+                self._http_client.post(
+                    f"{card.endpoint}/tasks/{task_id}/messages",
+                    json=msg.to_dict(),
+                    headers=await self._get_auth_headers(card)
+                ),
+                timeout=30.0
+            )
+        except asyncio.TimeoutError:
+            raise TimeoutError(
+                f"HTTP request timed out after 30 seconds sending message to task {task_id}"
+            )
         response.raise_for_status()
 
         task.messages.append(msg)
@@ -411,10 +472,18 @@ class A2AClient:
         if not card:
             raise ValueError(f"Unknown agent: {task.target_agent}")
 
-        response = await self._http_client.get(
-            f"{card.endpoint}/tasks/{task_id}",
-            headers=await self._get_auth_headers(card)
-        )
+        try:
+            response = await asyncio.wait_for(
+                self._http_client.get(
+                    f"{card.endpoint}/tasks/{task_id}",
+                    headers=await self._get_auth_headers(card)
+                ),
+                timeout=30.0
+            )
+        except asyncio.TimeoutError:
+            raise TimeoutError(
+                f"HTTP request timed out after 30 seconds getting status for task {task_id}"
+            )
         response.raise_for_status()
 
         data = response.json()
@@ -435,10 +504,18 @@ class A2AClient:
         if not card:
             raise ValueError(f"Unknown agent: {task.target_agent}")
 
-        response = await self._http_client.post(
-            f"{card.endpoint}/tasks/{task_id}/cancel",
-            headers=await self._get_auth_headers(card)
-        )
+        try:
+            response = await asyncio.wait_for(
+                self._http_client.post(
+                    f"{card.endpoint}/tasks/{task_id}/cancel",
+                    headers=await self._get_auth_headers(card)
+                ),
+                timeout=30.0
+            )
+        except asyncio.TimeoutError:
+            raise TimeoutError(
+                f"HTTP request timed out after 30 seconds cancelling task {task_id}"
+            )
         response.raise_for_status()
 
         task.state = TaskState.CANCELLED
@@ -475,7 +552,7 @@ class A2AClient:
     def _get_api_key(self, agent_name: str) -> str:
         """Retrieve API key from secure storage"""
         # In production, use a secrets manager
-        import os
+        import os  # noqa: PLC0415 - lazy import for optional feature
         key = os.environ.get(f"A2A_API_KEY_{agent_name.upper()}")
         if not key:
             raise ValueError(f"No API key configured for agent: {agent_name}")
@@ -488,13 +565,21 @@ class A2AClient:
         if not card.authentication.token_url:
             raise ValueError(f"No token URL for agent: {card.name}")
 
-        response = await self._http_client.post(
-            card.authentication.token_url,
-            data={
-                "grant_type": "client_credentials",
-                "scope": " ".join(card.authentication.scopes)
-            }
-        )
+        try:
+            response = await asyncio.wait_for(
+                self._http_client.post(
+                    card.authentication.token_url,
+                    data={
+                        "grant_type": "client_credentials",
+                        "scope": " ".join(card.authentication.scopes)
+                    }
+                ),
+                timeout=30.0
+            )
+        except asyncio.TimeoutError:
+            raise TimeoutError(
+                f"HTTP request timed out after 30 seconds obtaining OAuth token for {card.name}"
+            )
         response.raise_for_status()
         return response.json()["access_token"]
 
@@ -641,7 +726,7 @@ class InventoryAgentHandler(A2ATaskHandler):
             source_agent=task_data["source_agent"],
             target_agent=task_data["target_agent"],
             capability=capability,
-            state=TaskState.IN_PROGRESS,
+            state=TaskState.WORKING,
             messages=parsed_messages,
             created_at=task_data["created_at"],
             updated_at=datetime.now(timezone.utc).isoformat()
@@ -825,7 +910,6 @@ async def example_usage():
         # )
 
         # Simulated task response for standalone demo
-        from datetime import datetime, timezone
         now = datetime.now(timezone.utc).isoformat()
         task = A2ATask(
             id="task-demo-001",

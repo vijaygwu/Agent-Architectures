@@ -17,15 +17,27 @@ This module provides:
 
 import asyncio
 import hashlib
-import jwt
 import logging
-import aiohttp
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from secrets import token_urlsafe
 from typing import Any
 import json
+
+try:
+    import jwt
+    JWT_AVAILABLE = True
+except ImportError:
+    JWT_AVAILABLE = False
+    jwt = None
+
+try:
+    import aiohttp
+    AIOHTTP_AVAILABLE = True
+except ImportError:
+    AIOHTTP_AVAILABLE = False
+    aiohttp = None
 
 # Configure structured logging
 logging.basicConfig(
@@ -183,11 +195,20 @@ class JWTAuth:
 # Asymmetric JWT Signing (Section: Asymmetric JWT Signing)
 # =============================================================================
 
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
+try:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    CRYPTOGRAPHY_AVAILABLE = True
+except ImportError:
+    CRYPTOGRAPHY_AVAILABLE = False
+    serialization = None
+    rsa = None
+
 
 class AsymmetricJWTAuth:
     def __init__(self, private_key_pem: bytes = None, public_key_pem: bytes = None):
+        if not CRYPTOGRAPHY_AVAILABLE:
+            raise ImportError("cryptography package required: pip install cryptography")
         if private_key_pem:
             self.private_key = serialization.load_pem_private_key(
                 private_key_pem, password=None
@@ -296,17 +317,38 @@ class IdentityService:
     Features:
     - Agent registration and management
     - JWT token issuance and verification
-    - Token revocation
+    - Token revocation with automatic expiry cleanup
     - Scope-based authorization
+
+    Requires: pip install PyJWT
     """
 
     def __init__(self, secret_key: str, issuer: str = "agent-system"):
+        if not JWT_AVAILABLE:
+            raise ImportError(
+                "PyJWT is required for IdentityService. Install with: pip install PyJWT"
+            )
         self.secret_key = secret_key
         self.issuer = issuer
         self.agents: dict[str, AgentIdentity] = {}
         self.tokens: dict[str, TokenInfo] = {}
-        self.revoked_tokens: set[str] = set()
+        # Store revoked tokens with their expiry time for cleanup
+        self._revoked_tokens: dict[str, datetime] = {}
         logger.info(f"IdentityService initialized with issuer: {issuer}")
+
+    @property
+    def revoked_tokens(self) -> set[str]:
+        """Get currently revoked tokens, auto-pruning expired ones."""
+        now = datetime.now(timezone.utc)
+        # Remove expired revocations (token would be invalid anyway)
+        expired = [tid for tid, exp in self._revoked_tokens.items() if exp < now]
+        for tid in expired:
+            del self._revoked_tokens[tid]
+        return set(self._revoked_tokens.keys())
+
+    def _revoke_token_id(self, token_id: str, expires_at: datetime) -> None:
+        """Internal method to revoke a token by ID."""
+        self._revoked_tokens[token_id] = expires_at
 
     # ----- Agent Management -----
 
@@ -353,7 +395,7 @@ class IdentityService:
             # Revoke all tokens for this agent
             for token_id, info in self.tokens.items():
                 if info.agent_id == agent_id:
-                    self.revoked_tokens.add(token_id)
+                    self._revoke_token_id(token_id, info.expires_at)
             logger.info(f"Deleted agent {agent_id} and revoked all tokens")
 
     def _default_scopes(self, role: AgentRole) -> set[str]:
@@ -439,17 +481,23 @@ class IdentityService:
 
     def revoke_token(self, token: str):
         """Revoke a specific token."""
-        payload = self.verify_token(token)
-        if payload and "jti" in payload:
-            self.revoked_tokens.add(payload["jti"])
-            logger.info(f"Revoked token {payload['jti']}")
+        try:
+            # Decode without verification to get expiry even if token is invalid
+            payload = jwt.decode(token, options={"verify_signature": False})
+            if "jti" in payload:
+                # Store with expiry time so we can clean up later
+                exp = datetime.fromtimestamp(payload.get("exp", 0), tz=timezone.utc)
+                self._revoked_tokens[payload["jti"]] = exp
+                logger.info(f"Revoked token {payload['jti']}")
+        except jwt.InvalidTokenError:
+            pass  # Invalid token, nothing to revoke
 
     def revoke_all_tokens(self, agent_id: str):
         """Revoke all tokens for an agent."""
         count = 0
         for token_id, info in self.tokens.items():
             if info.agent_id == agent_id:
-                self.revoked_tokens.add(token_id)
+                self._revoke_token_id(token_id, info.expires_at)
                 count += 1
         logger.info(f"Revoked {count} tokens for agent {agent_id}")
 
@@ -569,7 +617,7 @@ class TokenManager:
         if self.current_token:
             payload = self.service.verify_token(self.current_token)
             if payload:
-                exp = datetime.fromtimestamp(payload["exp"])
+                exp = datetime.fromtimestamp(payload["exp"], tz=timezone.utc)
                 if exp - datetime.now(timezone.utc) > self.refresh_threshold:
                     return self.current_token
 
@@ -927,11 +975,20 @@ class LeastPrivilegeAssigner:
 
 # Token Security (Section: Token Security)
 
+try:
+    from cryptography.fernet import Fernet
+    FERNET_AVAILABLE = True
+except ImportError:
+    FERNET_AVAILABLE = False
+    Fernet = None
+
+
 class SecureTokenStorage:
     """Store tokens securely."""
 
     def __init__(self, encryption_key: bytes):
-        from cryptography.fernet import Fernet
+        if not FERNET_AVAILABLE:
+            raise ImportError("cryptography package required: pip install cryptography")
         self.fernet = Fernet(encryption_key)
         self.tokens: dict[str, bytes] = {}
 
@@ -997,11 +1054,22 @@ class CredentialRotator:
 # Demo / Main
 # =============================================================================
 
-async def main():
+async def main(demo_mode: bool = False):
     """Demonstrate identity service usage."""
+    import os
 
-    # Initialize service
-    service = IdentityService(secret_key="your-secret-key-here")
+    # Initialize service with secure key from environment
+    secret_key = os.environ.get("IDENTITY_SECRET_KEY")
+    if not secret_key:
+        if demo_mode:
+            secret_key = "DEMO-ONLY-DO-NOT-USE-IN-PRODUCTION"
+            print("WARNING: Using demo secret key. Set IDENTITY_SECRET_KEY in production.")
+        else:
+            raise ValueError(
+                "IDENTITY_SECRET_KEY environment variable required. "
+                "Set it to a secure random string (at least 32 characters)."
+            )
+    service = IdentityService(secret_key=secret_key)
 
     # Register agents
     orchestrator = service.register_agent(
@@ -1042,4 +1110,5 @@ async def main():
     print(f"\nAfter revocation, worker token valid: {still_valid}")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Run in demo mode by default for easier testing
+    asyncio.run(main(demo_mode=True))

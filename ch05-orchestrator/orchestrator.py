@@ -18,10 +18,27 @@ To run without LangGraph, use SimpleOrchestrator:
     result = await orchestrator.run("your task")
 
 To use the full LangGraph version, install: pip install langgraph
+
+NOTE ON EXAMPLES: This module uses asyncio.sleep() to simulate API calls
+for demonstration purposes. Production implementations require:
+- Actual LLM client calls (see common/utils.py for patterns)
+- Retry logic with exponential backoff (see @with_retry decorator)
+- Timeout handling (see asyncio.wait_for patterns)
+- Circuit breakers for external service failures (see Guardian chapter)
+- Structured error responses, not just exceptions
+
+See the Research Assistant chapter (ch12) for a more complete production example.
+
+Production Notes:
+- Add retry logic with exponential backoff for worker failures
+- Implement circuit breakers for external service calls
+- Use structured logging for task tracing across workers
+- Consider adding task timeouts and cancellation support
 """
 
 import asyncio
 import json
+import logging
 import operator
 from datetime import datetime, timezone
 from typing import Annotated, Any, Literal, TypedDict
@@ -29,8 +46,92 @@ from dataclasses import dataclass, field
 from enum import Enum
 import uuid
 
-from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.memory import MemorySaver
+# Import common utilities for structured logging
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent / "common"))
+try:
+    from utils import configure_logging, get_tracer
+    logger = configure_logging(level="INFO", json_output=True, logger_name="orchestrator")
+    tracer = get_tracer("orchestrator")
+except ImportError:
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger("orchestrator")
+    # No-op tracer fallback
+    class _NoOpSpan:
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def set_attribute(self, k, v): pass
+        def add_event(self, n, a=None): pass
+    class _NoOpTracer:
+        def start_as_current_span(self, n, **kw): return _NoOpSpan()
+    tracer = _NoOpTracer()
+
+try:
+    from langgraph.graph import StateGraph, END
+    from langgraph.checkpoint.memory import MemorySaver
+    LANGGRAPH_AVAILABLE = True
+except ImportError:
+    LANGGRAPH_AVAILABLE = False
+    StateGraph = None
+    END = None
+    MemorySaver = None
+
+from typing import Protocol
+
+
+# =============================================================================
+# Persistence Layer
+# =============================================================================
+
+class PersistenceBackend(Protocol):
+    """Protocol for state persistence backends."""
+    async def save_state(self, task_id: str, state: dict) -> None: ...
+    async def load_state(self, task_id: str) -> dict | None: ...
+    async def delete_state(self, task_id: str) -> None: ...
+
+
+class InMemoryPersistence:
+    """Default in-memory persistence (no durability)."""
+    def __init__(self):
+        self._store: dict[str, dict] = {}
+
+    async def save_state(self, task_id: str, state: dict) -> None:
+        self._store[task_id] = state
+
+    async def load_state(self, task_id: str) -> dict | None:
+        return self._store.get(task_id)
+
+    async def delete_state(self, task_id: str) -> None:
+        self._store.pop(task_id, None)
+
+
+# Optional Redis persistence
+try:
+    import redis.asyncio as aioredis
+    REDIS_AVAILABLE = True
+except ImportError:
+    REDIS_AVAILABLE = False
+    aioredis = None
+
+
+class RedisPersistence:
+    """Redis-backed persistence for production use."""
+    def __init__(self, redis_url: str = "redis://localhost:6379"):
+        if not REDIS_AVAILABLE:
+            raise ImportError("redis package required: pip install redis")
+        self._redis = aioredis.from_url(redis_url)
+        self._prefix = "orchestrator:task:"
+
+    async def save_state(self, task_id: str, state: dict) -> None:
+        await self._redis.set(f"{self._prefix}{task_id}", json.dumps(state), ex=86400)
+
+    async def load_state(self, task_id: str) -> dict | None:
+        data = await self._redis.get(f"{self._prefix}{task_id}")
+        return json.loads(data) if data else None
+
+    async def delete_state(self, task_id: str) -> None:
+        await self._redis.delete(f"{self._prefix}{task_id}")
 
 
 # =============================================================================
@@ -132,8 +233,8 @@ class ResearchWorker(BaseWorker):
         2. Query knowledge bases
         3. Analyze documents
         """
-        # Simulate research with structured output
-        await asyncio.sleep(0.5)  # Simulate API call
+        # DEMO ONLY: Replace with actual LLM call + retry logic in production
+        await asyncio.sleep(0.5)  # Simulates API latency
 
         return {
             "findings": [
@@ -412,9 +513,10 @@ class MultiAgentOrchestrator:
     - Error handling and recovery
     """
 
-    def __init__(self):
+    def __init__(self, persistence: PersistenceBackend | None = None):
         self.planner = TaskPlanner()
         self.aggregator = ResultAggregator()
+        self._persistence = persistence or InMemoryPersistence()
 
         # Initialize workers
         self.workers: dict[WorkerType, BaseWorker] = {
@@ -430,6 +532,8 @@ class MultiAgentOrchestrator:
 
     def _build_graph(self) -> StateGraph:
         """Build the LangGraph orchestration graph"""
+        if not LANGGRAPH_AVAILABLE:
+            raise ImportError("langgraph is required for MultiAgentOrchestrator. Install with: pip install langgraph")
 
         # Create graph with state schema
         graph = StateGraph(OrchestratorState)
@@ -525,11 +629,60 @@ class MultiAgentOrchestrator:
         self,
         worker: BaseWorker,
         subtask: Subtask,
-        context: dict
+        context: dict,
+        max_retries: int = 3,
+        timeout_seconds: float = 120.0
     ) -> Any:
-        """Execute a single subtask with a worker"""
-        subtask.status = "in_progress"
-        return await worker.execute(subtask, context)
+        """
+        Execute a single subtask with a worker, with retry logic and timeout.
+
+        Args:
+            worker: The worker to execute the subtask
+            subtask: The subtask to execute
+            context: Context for execution
+            max_retries: Maximum number of retry attempts (default: 3)
+            timeout_seconds: Timeout per attempt in seconds (default: 120)
+
+        Returns:
+            The result from the worker
+
+        Raises:
+            TimeoutError: If all retry attempts timeout
+            Exception: If all retry attempts fail with errors
+        """
+        with tracer.start_as_current_span(f"subtask.{subtask.id}") as span:
+            span.set_attribute("worker.type", worker.__class__.__name__)
+            span.set_attribute("subtask.id", subtask.id)
+            span.set_attribute("subtask.type", subtask.worker_type.value)
+            span.set_attribute("max_retries", max_retries)
+
+            subtask.status = "in_progress"
+            last_error = None
+
+            for attempt in range(max_retries):
+                span.add_event(f"attempt.{attempt + 1}")
+                try:
+                    result = await asyncio.wait_for(
+                        worker.execute(subtask, context),
+                        timeout=timeout_seconds
+                    )
+                    span.set_attribute("status", "success")
+                    return result
+                except asyncio.TimeoutError:
+                    last_error = TimeoutError(
+                        f"Worker {worker.__class__.__name__} timed out on subtask {subtask.id} "
+                        f"(attempt {attempt + 1}/{max_retries})"
+                    )
+                except Exception as e:
+                    last_error = e
+
+                # Exponential backoff before retry
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+
+            span.set_attribute("status", "failed")
+            span.set_attribute("error", str(last_error))
+            raise last_error
 
     def _should_continue(self, state: OrchestratorState) -> str:
         """Determine if more phases need execution"""
@@ -601,7 +754,8 @@ class SimpleOrchestrator:
     in a few lines of code."
     """
 
-    def __init__(self):
+    def __init__(self, persistence: PersistenceBackend | None = None):
+        self._persistence = persistence or InMemoryPersistence()
         self.workers: dict[WorkerType, BaseWorker] = {
             WorkerType.RESEARCH: ResearchWorker(),
             WorkerType.ANALYSIS: AnalysisWorker(),
@@ -610,10 +764,17 @@ class SimpleOrchestrator:
             WorkerType.REVIEW: ReviewWorker(),
         }
 
-    async def run(self, task: str, context: dict | None = None) -> dict:
-        """Run task through orchestration pipeline."""
+    async def run(self, task: str, context: dict | None = None, task_id: str | None = None) -> dict:
+        """Run task through orchestration pipeline with optional persistence."""
         context = context or {}
+        task_id = task_id or str(uuid.uuid4())
         results = {}
+
+        # Try to restore from checkpoint
+        saved_state = await self._persistence.load_state(task_id)
+        if saved_state:
+            results = saved_state.get("results", {})
+            logger.info(f"Restored checkpoint for task {task_id}")
 
         # Phase 1: Research (parallel)
         research_tasks = [
@@ -630,6 +791,7 @@ class SimpleOrchestrator:
         ]
         research_results = await asyncio.gather(*research_tasks)
         results["research"] = research_results
+        await self._persistence.save_state(task_id, {"results": results, "phase": "research"})
 
         # Phase 2: Analysis
         analysis_result = await self.workers[WorkerType.ANALYSIS].execute(
@@ -639,6 +801,7 @@ class SimpleOrchestrator:
             context
         )
         results["analysis"] = analysis_result
+        await self._persistence.save_state(task_id, {"results": results, "phase": "analysis"})
 
         # Phase 3: Writing
         writing_result = await self.workers[WorkerType.WRITING].execute(
@@ -649,8 +812,12 @@ class SimpleOrchestrator:
         )
         results["writing"] = writing_result
 
+        # Clean up checkpoint on successful completion
+        await self._persistence.delete_state(task_id)
+
         return {
             "task": task,
+            "task_id": task_id,
             "results": results,
             "final_output": writing_result.get("content", ""),
             "status": "completed"
@@ -678,21 +845,27 @@ async def main():
     print(f"Status: {result['status']}")
     print(f"\nFinal Output:\n{result['final_output'][:500]}...")
 
-    print("\n" + "=" * 60)
-    print("LangGraph Orchestrator Demo")
-    print("=" * 60)
+    if LANGGRAPH_AVAILABLE:
+        print("\n" + "=" * 60)
+        print("LangGraph Orchestrator Demo")
+        print("=" * 60)
 
-    orchestrator = MultiAgentOrchestrator()
-    result = await orchestrator.run(
-        task="Create a market analysis report on AI agent platforms",
-        context={"focus": "enterprise", "competitors": ["Google", "AWS", "Azure"]}
-    )
+        orchestrator = MultiAgentOrchestrator()
+        result = await orchestrator.run(
+            task="Create a market analysis report on AI agent platforms",
+            context={"focus": "enterprise", "competitors": ["Google", "AWS", "Azure"]}
+        )
 
-    print(f"\nTask: {result['task']}")
-    print(f"Status: {result['status']}")
-    print(f"Phases Completed: {result['current_phase']}")
-    print(f"Subtasks: {len(result['subtasks'])}")
-    print(f"\nFinal Output:\n{result['final_output'][:500]}...")
+        print(f"\nTask: {result['task']}")
+        print(f"Status: {result['status']}")
+        print(f"Phases Completed: {result['current_phase']}")
+        print(f"Subtasks: {len(result['subtasks'])}")
+        print(f"\nFinal Output:\n{result['final_output'][:500]}...")
+    else:
+        print("\n" + "=" * 60)
+        print("LangGraph not available - skipping MultiAgentOrchestrator demo")
+        print("Install with: pip install langgraph")
+        print("=" * 60)
 
 
 if __name__ == "__main__":

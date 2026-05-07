@@ -25,18 +25,19 @@ class MCPClient:
         self.request_id = 0
         self.reader = None
         self.writer = None
+        self.process = None
         self.tools: dict[str, MCPTool] = {}
 
     async def connect_stdio(self, command: list[str]):
         """Connect to an MCP server via stdio."""
-        process = await asyncio.create_subprocess_exec(
+        self.process = await asyncio.create_subprocess_exec(
             *command,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        self.reader = process.stdout
-        self.writer = process.stdin
+        self.reader = self.process.stdout
+        self.writer = self.process.stdin
 
         # Initialize
         await self._initialize()
@@ -61,7 +62,7 @@ class MCPClient:
         response = json.loads(line.decode())
 
         if "error" in response:
-            raise MCPError(response["error"]["message"])
+            raise MCPError(response["error"]["message"]) from None
 
         return response.get("result", {})
 
@@ -111,6 +112,22 @@ class MCPClient:
             }
             for tool in self.tools.values()
         ]
+
+    async def close(self):
+        """Close the MCP connection and terminate the subprocess."""
+        if self.writer:
+            try:
+                self.writer.close()
+                await self.writer.wait_closed()
+            except Exception:
+                pass  # Already closed or errored
+        if self.process:
+            try:
+                self.process.terminate()
+                await self.process.wait()
+            except Exception:
+                pass  # Already terminated
+
 
 class MCPError(Exception):
     pass

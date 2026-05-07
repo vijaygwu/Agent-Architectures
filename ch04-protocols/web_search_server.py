@@ -32,7 +32,7 @@ class JsonRpcRequest:
     jsonrpc: str
     id: int | str
     method: str
-    params: dict = None
+    params: dict | None = None
 
 
 @dataclass
@@ -54,9 +54,10 @@ class Tool:
 # Tool Implementations
 # =============================================================================
 
-async def web_search(query: str, num_results: int = 5) -> dict:
+async def web_search(query: str, num_results: int = 5, timeout_seconds: float = 30.0) -> dict:
     """Search the web using DuckDuckGo."""
-    async with aiohttp.ClientSession() as session:
+    timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
         url = "https://api.duckduckgo.com/"
         params = {"q": query, "format": "json", "no_html": 1}
 
@@ -98,8 +99,10 @@ async def fetch_url(url: str, max_length: int = 10000) -> dict:
                 else:
                     err = f"HTTP {response.status}"
                     return {"success": False, "error": err, "url": url}
-        except Exception as e:
-            return {"success": False, "error": str(e), "url": url}
+        except aiohttp.ClientError as e:
+            return {"success": False, "error": f"Client error: {e}", "url": url}
+        except asyncio.TimeoutError:
+            return {"success": False, "error": "Request timed out", "url": url}
 
 
 # =============================================================================
@@ -174,7 +177,7 @@ class MCPServer:
                     id=request.id,
                     error={"code": -32601, "message": f"Unknown method: {method}"}
                 )
-        except Exception as e:
+        except (ValueError, TypeError, KeyError) as e:
             return JsonRpcResponse(
                 id=request.id,
                 error={"code": -32603, "message": str(e)}

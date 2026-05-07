@@ -2,12 +2,15 @@
 Complete Example: Multi-Agent Research Assistant
 ================================================
 
-A production-ready research assistant demonstrating:
+A demonstration research assistant showing:
 - Multi-agent collaboration for complex research tasks
 - Swarm-based parallel information gathering
 - Council-based synthesis and validation
 - Source attribution and citation management
 - Quality control and fact-checking
+
+Note: This example uses simulated data sources for demonstration.
+For production use, integrate with real APIs and search services.
 
 Handles research queries from planning through final report.
 """
@@ -17,7 +20,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Optional, Callable
+from typing import Any, Optional
 from collections import defaultdict
 import hashlib
 
@@ -307,7 +310,7 @@ class GathererAgent(ResearchAgent):
             if source.source_type == source_type:
                 # Return a copy with unique ID
                 return Source(
-                    id=f"src_{hashlib.md5(str(time.time()).encode()).hexdigest()[:8]}",
+                    id=f"src_{uuid.uuid4().hex[:8]}",
                     url=source.url,
                     title=source.title,
                     source_type=source.source_type,
@@ -402,7 +405,7 @@ class AnalyzerAgent(ResearchAgent):
 
         for i, stmt in enumerate(base_statements[:2]):
             facts.append(Fact(
-                id=f"fact_{hashlib.md5((source.id + str(i)).encode()).hexdigest()[:8]}",
+                id=f"fact_{hashlib.sha256((source.id + str(i)).encode()).hexdigest()[:8]}",
                 statement=stmt,
                 sources=[source.id],
                 confidence=0.7 if source.credibility == SourceCredibility.HIGH else 0.5,

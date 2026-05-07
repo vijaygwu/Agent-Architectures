@@ -23,7 +23,167 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from secrets import token_urlsafe
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
+
+try:
+    from fastapi import FastAPI
+    FASTAPI_AVAILABLE = True
+except ImportError:
+    FASTAPI_AVAILABLE = False
+    FastAPI = None
+
+from pydantic import BaseModel
+
+# Import structured logging
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent / "common"))
+try:
+    from utils import configure_logging
+    logger = configure_logging(level="INFO", json_output=True, logger_name="gateway")
+except ImportError:
+    import logging
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger("gateway")
+
+# Optional dependency check
+try:
+    import anthropic
+    ANTHROPIC_AVAILABLE = True
+except ImportError:
+    ANTHROPIC_AVAILABLE = False
+
+# Prometheus metrics support (optional)
+try:
+    from prometheus_client import (
+        Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
+    )
+    PROMETHEUS_AVAILABLE = True
+
+    # Define Prometheus metrics
+    REQUEST_COUNT = Counter(
+        'gateway_requests_total',
+        'Total requests processed by the gateway',
+        ['method', 'endpoint', 'status']
+    )
+    REQUEST_LATENCY = Histogram(
+        'gateway_request_latency_seconds',
+        'Request latency in seconds',
+        ['endpoint'],
+        buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
+    )
+    ACTIVE_TASKS = Gauge(
+        'gateway_active_tasks',
+        'Number of currently active tasks'
+    )
+    POLICY_DECISIONS = Counter(
+        'gateway_policy_decisions_total',
+        'Policy decisions made by the gateway',
+        ['policy_name', 'action']
+    )
+    CIRCUIT_BREAKER_STATE = Gauge(
+        'gateway_circuit_breaker_state',
+        'Circuit breaker state (0=closed, 1=open, 2=half-open)',
+        ['breaker_name']
+    )
+except ImportError:
+    PROMETHEUS_AVAILABLE = False
+    generate_latest = None
+    CONTENT_TYPE_LATEST = None
+
+
+# =============================================================================
+# FastAPI App and Health Check Endpoints
+# =============================================================================
+
+app = FastAPI(title="Policy Gateway", version="1.0.0") if FASTAPI_AVAILABLE else None
+
+# Track startup time
+_startup_time = datetime.now(timezone.utc)
+
+
+class HealthResponse(BaseModel):
+    status: str
+    timestamp: str
+    version: str
+    uptime_seconds: float
+
+
+class ReadinessResponse(BaseModel):
+    ready: bool
+    checks: dict[str, bool]
+
+
+if app:
+    @app.get("/health", response_model=HealthResponse)
+    async def health_check() -> HealthResponse:
+        """Liveness probe - is the service running?"""
+        now = datetime.now(timezone.utc)
+        return HealthResponse(
+            status="healthy",
+            timestamp=now.isoformat(),
+            version="1.0.0",
+            uptime_seconds=(now - _startup_time).total_seconds()
+        )
+
+    @app.get("/ready", response_model=ReadinessResponse)
+    async def readiness_check() -> ReadinessResponse:
+        """Readiness probe - is the service ready to accept traffic?"""
+        checks = {}
+
+        # Check if required dependencies are available
+        checks["anthropic_sdk"] = ANTHROPIC_AVAILABLE
+        checks["config_loaded"] = True  # Add actual config check if needed
+
+        return ReadinessResponse(
+            ready=all(checks.values()),
+            checks=checks
+        )
+
+    @app.get("/metrics")
+    async def metrics(format: str = "json"):
+        """
+        Metrics endpoint for monitoring.
+
+        Args:
+            format: Output format - 'json' (default) or 'prometheus'
+
+        Returns:
+            Metrics in requested format
+        """
+        if format == "prometheus" and PROMETHEUS_AVAILABLE:
+            from fastapi.responses import Response
+            return Response(
+                content=generate_latest(),
+                media_type=CONTENT_TYPE_LATEST
+            )
+
+        return {
+            "requests_total": getattr(app.state, 'request_count', 0),
+            "errors_total": getattr(app.state, 'error_count', 0),
+            "uptime_seconds": (datetime.now(timezone.utc) - _startup_time).total_seconds(),
+            "prometheus_available": PROMETHEUS_AVAILABLE
+        }
+
+    @app.get("/metrics/prometheus")
+    async def prometheus_metrics():
+        """
+        Prometheus-compatible metrics endpoint.
+
+        Returns metrics in Prometheus text format for scraping.
+        Install prometheus-client: pip install prometheus-client
+        """
+        if not PROMETHEUS_AVAILABLE:
+            return {
+                "error": "prometheus_client not installed",
+                "install": "pip install prometheus-client"
+            }
+
+        from fastapi.responses import Response
+        return Response(
+            content=generate_latest(),
+            media_type=CONTENT_TYPE_LATEST
+        )
 
 
 # =============================================================================
@@ -452,7 +612,7 @@ class PolicyEnforcedAgent:
         if decision.verdict == Verdict.DENY:
             raise PolicyViolationError(
                 f"Action denied: {', '.join(decision.reasons)}"
-            )
+            ) from None
 
         if decision.verdict == Verdict.RATE_LIMITED:
             retry_after = decision.metadata.get("retry_after", 60)
@@ -735,10 +895,21 @@ class PolicySimulator:
 # Policy Observability (Section 11.11)
 # =============================================================================
 
+class MetricsClient(Protocol):
+    """Protocol for metrics collection."""
+    def increment(self, name: str, tags: dict = None) -> None: ...
+    def histogram(self, name: str, value: float) -> None: ...
+
+
+class TraceClient(Protocol):
+    """Protocol for distributed tracing."""
+    def start_span(self, name: str, attributes: dict = None) -> Any: ...
+
+
 class PolicyObserver:
     """Collects metrics and traces for policy enforcement."""
 
-    def __init__(self, metrics_client, trace_client):
+    def __init__(self, metrics_client: MetricsClient, trace_client: TraceClient):
         self.metrics = metrics_client
         self.tracer = trace_client
 

@@ -6,6 +6,12 @@ Implements emergent coordination through pheromone-based communication,
 stigmergic coordination, and self-organizing agent behaviors.
 
 Based on OpenAI Swarm concepts and ant colony optimization principles.
+
+Production Notes:
+- Use persistent storage for pheromone trails in distributed deployments
+- Implement health checks and auto-scaling for agent pool management
+- Add metrics collection for swarm convergence and task throughput
+- Consider rate limiting on pheromone deposits to prevent flooding
 """
 
 import asyncio
@@ -16,28 +22,180 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from itertools import cycle
 from typing import Any, Callable, Optional
 from collections import defaultdict
 import json
 import hashlib
+import logging
 
-# Assume embedding utilities available (e.g., from openai or sentence_transformers)
-# def get_embedding(text: str) -> list[float]: ...
-# def cosine_similarity(a: list[float], b: list[float]) -> float: ...
+# Import common utilities for structured logging
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent / "common"))
+try:
+    from utils import configure_logging, get_tracer
+    logger = configure_logging(level="INFO", json_output=True, logger_name="swarm")
+    tracer = get_tracer("swarm")
+except ImportError:
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger("swarm")
+    # No-op tracer fallback
+    class _NoOpSpan:
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def set_attribute(self, k, v): pass
+        def add_event(self, n, a=None): pass
+    class _NoOpTracer:
+        def start_as_current_span(self, n, **kw): return _NoOpSpan()
+    tracer = _NoOpTracer()
 
-# Placeholder implementations for embedding utilities
+# =============================================================================
+# EMBEDDING FUNCTIONS
+# =============================================================================
+# This module supports two embedding backends:
+#   - Option A: OpenAI embeddings (async, requires API key)
+#   - Option B: Sentence-transformers (local, no API key needed) [DEFAULT]
+#
+# If neither library is available, falls back to random vectors with a warning.
+# =============================================================================
+
+# Try to import sentence-transformers (preferred, works offline without API key)
+try:
+    from sentence_transformers import SentenceTransformer
+    SENTENCE_TRANSFORMERS_AVAILABLE = True
+    _embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+except ImportError:
+    SENTENCE_TRANSFORMERS_AVAILABLE = False
+    _embedding_model = None
+
+# Try to import OpenAI (alternative, requires API key)
+try:
+    from openai import OpenAI
+    OPENAI_AVAILABLE = True
+    _openai_client = None  # Lazy initialization to avoid API key requirement at import
+except ImportError:
+    OPENAI_AVAILABLE = False
+    _openai_client = None
+
+# Track whether we've warned about fallback mode
+_fallback_warning_shown = False
+
+
+def cleanup_embedding_client():
+    """Clean up the OpenAI client if it was created."""
+    global _openai_client
+    if _openai_client is not None:
+        _openai_client = None
+
+
 def get_embedding(text: str) -> list[float]:
-    """Placeholder for embedding function."""
-    # Simple hash-based pseudo-embedding for demonstration
-    h = hashlib.md5(text.encode()).hexdigest()
-    return [int(h[i:i+2], 16) / 255.0 for i in range(0, 32, 2)]
+    """
+    Generate an embedding vector from text.
+
+    Uses sentence-transformers by default (local, no API key needed).
+    Falls back to OpenAI if sentence-transformers is unavailable.
+    If neither is available, returns random vectors (for testing only).
+
+    Args:
+        text: Input text to embed
+
+    Returns:
+        Embedding vector (384 dims for sentence-transformers, 1536 for OpenAI,
+        384 for fallback random vectors)
+    """
+    global _fallback_warning_shown
+
+    # Option B (default): Sentence-transformers (local, no API key)
+    if SENTENCE_TRANSFORMERS_AVAILABLE and _embedding_model is not None:
+        return _embedding_model.encode(text).tolist()
+
+    # Option A: OpenAI embeddings (requires API key)
+    if OPENAI_AVAILABLE:
+        global _openai_client
+        if _openai_client is None:
+            _openai_client = OpenAI(timeout=30.0)
+        response = _openai_client.embeddings.create(
+            input=text,
+            model="text-embedding-3-small"
+        )
+        return response.data[0].embedding
+
+    # Fallback: Random vectors (for testing only - NOT FOR PRODUCTION)
+    import os
+    if os.environ.get("SWARM_ALLOW_RANDOM_EMBEDDINGS", "").lower() != "true":
+        raise ImportError(
+            "No embedding library available. Install one of:\n"
+            "  pip install sentence-transformers  (recommended, works offline)\n"
+            "  pip install openai                 (requires API key)\n"
+            "Or set SWARM_ALLOW_RANDOM_EMBEDDINGS=true for testing (NOT for production)."
+        )
+
+    if not _fallback_warning_shown:
+        import warnings
+        warnings.warn(
+            "Using random vectors for embeddings (SWARM_ALLOW_RANDOM_EMBEDDINGS=true). "
+            "This does NOT capture semantic meaning and should ONLY be used for testing.",
+            UserWarning
+        )
+        _fallback_warning_shown = True
+
+    import random
+    return [random.random() for _ in range(384)]
+
+
+async def get_embedding_async(text: str) -> list[float]:
+    """
+    Async version of get_embedding for use with OpenAI's async client.
+
+    Falls back to sync version if OpenAI async is not available.
+
+    Args:
+        text: Input text to embed
+
+    Returns:
+        Embedding vector
+    """
+    # For sentence-transformers, just use the sync version (it's local and fast)
+    if SENTENCE_TRANSFORMERS_AVAILABLE and _embedding_model is not None:
+        return _embedding_model.encode(text).tolist()
+
+    # For OpenAI, use async client if available
+    if OPENAI_AVAILABLE:
+        try:
+            from openai import AsyncOpenAI
+            async with AsyncOpenAI(timeout=30.0) as client:
+                response = await client.embeddings.create(
+                    input=text,
+                    model="text-embedding-3-small"
+                )
+                return response.data[0].embedding
+        except ImportError:
+            # Fall back to sync version
+            return get_embedding(text)
+
+    # Fallback to sync version (which handles random vectors)
+    return get_embedding(text)
+
 
 def cosine_similarity(a: list[float], b: list[float]) -> float:
-    """Compute cosine similarity between two vectors."""
+    """
+    Compute cosine similarity between two vectors.
+
+    This implementation is production-ready. Alternatively, use:
+    - scipy.spatial.distance.cosine (returns distance, not similarity)
+    - sklearn.metrics.pairwise.cosine_similarity
+    - numpy: np.dot(a,b) / (np.linalg.norm(a) * np.linalg.norm(b))
+
+    Args:
+        a: First embedding vector
+        b: Second embedding vector
+
+    Returns:
+        Cosine similarity in range [-1, 1], where 1 means identical direction
+    """
     dot = sum(x * y for x, y in zip(a, b))
     norm_a = math.sqrt(sum(x * x for x in a))
-    norm_b = math.sqrt(sum(y * y for y in b))
+    norm_b = math.sqrt(sum(x * x for x in b))
     if norm_a == 0 or norm_b == 0:
         return 0.0
     return dot / (norm_a * norm_b)
@@ -89,12 +247,16 @@ class PheromoneField:
     indirectly through modifications to the environment.
     """
 
-    def __init__(self):
+    def __init__(self, max_pheromones: int = 10000):
         self.pheromones: list[Pheromone] = []
+        self.max_pheromones = max_pheromones
 
     def deposit(self, pheromone: Pheromone):
-        """Add a pheromone to the field."""
+        """Add a pheromone to the field, auto-pruning if at capacity."""
         self.pheromones.append(pheromone)
+        # Auto-prune when exceeding capacity to prevent unbounded growth
+        if len(self.pheromones) > self.max_pheromones:
+            self.prune(threshold=0.05)
 
     def sense(self, location: str, radius: float = 0.5) -> list[Pheromone]:
         """Detect pheromones near a location."""
@@ -328,64 +490,74 @@ class SwarmAgent:
 
     async def _execute_task(self, task: SwarmTask):
         """Execute a claimed task."""
-        self.current_tasks.append(task)
-        location = task.to_location()
+        with tracer.start_as_current_span(f"swarm.task.{task.id}") as span:
+            span.set_attribute("task.id", task.id)
+            span.set_attribute("task.type", task.type)
+            span.set_attribute("agent.id", self.id)
+            span.set_attribute("task.attempts", task.attempts)
 
-        # Deposit exploration pheromone
-        self.pheromone_trail.deposit(Pheromone(
-            type=PheromoneType.EXPLORED,
-            location=location,
-            intensity=0.5,
-            created_by=self.id
-        ))
+            self.current_tasks.append(task)
+            location = task.to_location()
 
-        try:
-            # Execute the task
-            result = await self._run_with_timeout(task)
-
-            # Success: deposit success pheromone
+            # Deposit exploration pheromone
             self.pheromone_trail.deposit(Pheromone(
-                type=PheromoneType.VALUE,
+                type=PheromoneType.EXPLORED,
                 location=location,
-                intensity=0.8,
-                data={"result_summary": str(result)[:100]},
+                intensity=0.5,
                 created_by=self.id
             ))
 
-            await self.task_pool.complete_task(task.id, result, success=True)
-            self.completed_count += 1
+            try:
+                # Execute the task
+                result = await self._run_with_timeout(task)
 
-            # Adjust exploration rate based on success
-            self._exploration_rate = max(0.1, self._exploration_rate - 0.02)
-
-        except Exception as e:
-            # Failure: deposit failure/danger pheromone
-            self.pheromone_trail.deposit(Pheromone(
-                type=PheromoneType.DANGER,
-                location=location,
-                intensity=0.6,
-                data={"error": str(e)},
-                created_by=self.id
-            ))
-
-            if task.attempts >= task.max_attempts - 1:
-                # Repeated failures: mark as danger
+                # Success: deposit success pheromone
                 self.pheromone_trail.deposit(Pheromone(
-                    type=PheromoneType.DANGER,
+                    type=PheromoneType.VALUE,
                     location=location,
-                    intensity=0.9,
-                    data={"reason": "repeated_failures"},
+                    intensity=0.8,
+                    data={"result_summary": str(result)[:100]},
                     created_by=self.id
                 ))
 
-            await self.task_pool.complete_task(task.id, str(e), success=False)
-            self.failed_count += 1
+                await self.task_pool.complete_task(task.id, result, success=True)
+                self.completed_count += 1
+                span.set_attribute("status", "success")
 
-            # Increase exploration on failure
-            self._exploration_rate = min(0.5, self._exploration_rate + 0.05)
+                # Adjust exploration rate based on success
+                self._exploration_rate = max(0.1, self._exploration_rate - 0.02)
 
-        finally:
-            self.current_tasks.remove(task)
+            except Exception as e:
+                span.set_attribute("status", "failed")
+                span.set_attribute("error", str(e))
+
+                # Failure: deposit failure/danger pheromone
+                self.pheromone_trail.deposit(Pheromone(
+                    type=PheromoneType.DANGER,
+                    location=location,
+                    intensity=0.6,
+                    data={"error": str(e)},
+                    created_by=self.id
+                ))
+
+                if task.attempts >= task.max_attempts - 1:
+                    # Repeated failures: mark as danger
+                    self.pheromone_trail.deposit(Pheromone(
+                        type=PheromoneType.DANGER,
+                        location=location,
+                        intensity=0.9,
+                        data={"reason": "repeated_failures"},
+                        created_by=self.id
+                    ))
+
+                await self.task_pool.complete_task(task.id, str(e), success=False)
+                self.failed_count += 1
+
+                # Increase exploration on failure
+                self._exploration_rate = min(0.5, self._exploration_rate + 0.05)
+
+            finally:
+                self.current_tasks.remove(task)
 
     async def _run_with_timeout(self, task: SwarmTask, timeout: float = 30.0) -> Any:
         """Run task handler with timeout."""
@@ -622,7 +794,10 @@ class HeterogeneousSwarm(Swarm):
                 to_remove = [a for a in self.agents.values()
                             if a.id.startswith(type_name)][:current - target_count]
                 for agent in to_remove:
-                    asyncio.create_task(agent.stop())
+                    # Track task to avoid 'Task was destroyed' warnings
+                    if not hasattr(self, '_pending_stops'):
+                        self._pending_stops = []
+                    self._pending_stops.append(asyncio.create_task(agent.stop()))
 
 
 class HierarchicalSwarm(Swarm):
@@ -1055,7 +1230,7 @@ class SwarmController:
 
 async def example_research_handler(task: SwarmTask) -> dict:
     """Example handler for research tasks."""
-    await asyncio.sleep(random.uniform(0.5, 2.0))  # Simulate work
+    await asyncio.sleep(random.uniform(0.1, 0.3))  # Simulate work
     return {
         "query": task.payload.get("query", ""),
         "results": [f"Result {i} for {task.payload.get('query', '')}"
@@ -1065,7 +1240,7 @@ async def example_research_handler(task: SwarmTask) -> dict:
 
 async def example_analysis_handler(task: SwarmTask) -> dict:
     """Example handler for analysis tasks."""
-    await asyncio.sleep(random.uniform(1.0, 3.0))  # Simulate work
+    await asyncio.sleep(random.uniform(0.2, 0.5))  # Simulate work
     return {
         "analysis": f"Analysis of {task.payload.get('data', 'unknown')}",
         "confidence": random.uniform(0.7, 0.99)
@@ -1074,7 +1249,7 @@ async def example_analysis_handler(task: SwarmTask) -> dict:
 
 async def example_writing_handler(task: SwarmTask) -> dict:
     """Example handler for writing tasks."""
-    await asyncio.sleep(random.uniform(0.5, 1.5))  # Simulate work
+    await asyncio.sleep(random.uniform(0.1, 0.3))  # Simulate work
     return {
         "content": f"Written content for topic: {task.payload.get('topic', 'unknown')}",
         "word_count": random.randint(100, 500)

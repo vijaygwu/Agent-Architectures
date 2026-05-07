@@ -18,11 +18,33 @@ from typing import Any
 from enum import Enum
 import aiohttp
 
+# Default timeout for HTTP operations
+DEFAULT_TIMEOUT = aiohttp.ClientTimeout(total=30.0)
+
+# Simple retry helper for HTTP operations
+async def _retry_http(coro_func, max_attempts=3, base_delay=1.0):
+    """Retry HTTP operation with exponential backoff."""
+    last_error = None
+    for attempt in range(max_attempts):
+        try:
+            return await coro_func()
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            last_error = e
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(base_delay * (2 ** attempt))
+    raise last_error
+
+
+class A2AError(Exception):
+    """Exception raised for A2A protocol errors."""
+    pass
+
+
 # A2A Types
 
-class TaskState(Enum):
+class TaskState(str, Enum):
     PENDING = "pending"
-    IN_PROGRESS = "in_progress"  # A2A spec terminology
+    WORKING = "working"  # A2A spec terminology
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -111,10 +133,11 @@ class A2AClient:
 
     def __init__(self):
         self.known_agents: dict[str, AgentCard] = {}
-        self.session: aiohttp.ClientSession = None
+        self.session: aiohttp.ClientSession | None = None
 
     async def __aenter__(self):
-        self.session = aiohttp.ClientSession()
+        timeout = aiohttp.ClientTimeout(total=30.0)
+        self.session = aiohttp.ClientSession(timeout=timeout)
         return self
 
     async def __aexit__(self, *args):
@@ -123,6 +146,8 @@ class A2AClient:
 
     async def discover_agent(self, url: str) -> AgentCard:
         """Fetch an agent's card from its well-known URL."""
+        if not self.session:
+            raise RuntimeError("Client not initialized. Use 'async with A2AClient()' context manager.")
         card_url = f"{url.rstrip('/')}/.well-known/agent.json"
 
         async with self.session.get(card_url) as response:
@@ -198,7 +223,7 @@ class A2AClient:
                                    timeout: float = 300,
                                    poll_interval: float = 1) -> Task:
         """Wait for a task to complete."""
-        start = asyncio.get_event_loop().time()
+        start = asyncio.get_running_loop().time()
 
         while True:
             task = await self.get_task_status(agent_url, task_id)
@@ -208,15 +233,12 @@ class A2AClient:
             if task.state in terminal_states:
                 return task
 
-            elapsed = asyncio.get_event_loop().time() - start
+            elapsed = asyncio.get_running_loop().time() - start
             if elapsed > timeout:
                 raise TimeoutError(
-                    f"Task {task_id} did not complete within {timeout}s")
+                    f"Task {task_id} did not complete within {timeout}s") from None
 
             await asyncio.sleep(poll_interval)
-
-class A2AError(Exception):
-    pass
 
 # A2A Server
 
@@ -270,7 +292,7 @@ class A2AServer:
 
     async def _process_task(self, task: Task):
         """Process a task using the handler."""
-        task.state = TaskState.IN_PROGRESS
+        task.state = TaskState.WORKING
 
         try:
             result = await self.task_handler(task)

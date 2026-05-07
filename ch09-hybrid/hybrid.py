@@ -198,6 +198,10 @@ class GuardedOrchestrator:
     checkpoints: list[str] = field(default_factory=lambda: [
         "pre_plan", "pre_execute", "post_execute", "pre_aggregate"
     ])
+    _execution_lock: asyncio.Lock = field(init=False)
+
+    def __post_init__(self):
+        self._execution_lock = asyncio.Lock()
 
     async def execute(self, task: str) -> "OrchestratorResult":
         # Checkpoint: Validate input
@@ -305,12 +309,13 @@ class GuardedOrchestrator:
 
             return result
 
-        # Temporarily replace tool executor
-        worker.execute_tool = guarded_tool_execution
-        try:
-            result = await worker.execute(subtask, context)
-        finally:
-            worker.execute_tool = original_execute_tool
+        # Temporarily replace tool executor (with lock for thread safety)
+        async with self._execution_lock:
+            worker.execute_tool = guarded_tool_execution
+            try:
+                result = await worker.execute(subtask, context)
+            finally:
+                worker.execute_tool = original_execute_tool
 
         return result
 
@@ -458,11 +463,17 @@ Deliberate on these options and recommend the best approach.
 """
 
     async def generate_baseline_options(self, question: str) -> list[dict]:
-        """Generate baseline options when swarm doesn't find enough."""
+        """Generate baseline options when swarm doesn't find enough.
+
+        # Placeholder: Override to generate domain-specific baseline options.
+        """
         return []
 
     async def synthesize_option(self, cluster: list) -> dict:
-        """Synthesize a cluster into an option."""
+        """Synthesize a cluster into an option.
+
+        # Placeholder: Override to synthesize meaningful options from clusters.
+        """
         return {"name": "option", "description": "synthesized option"}
 
 
@@ -530,7 +541,17 @@ Return a JSON array of phases:
             {"role": "user", "content": planning_prompt}
         ])
 
-        phase_data = json.loads(response.content)
+        try:
+            phase_data = json.loads(response.content)
+        except json.JSONDecodeError:
+            # Fallback to single-phase execution if LLM response isn't valid JSON
+            return [HybridPhase(
+                id="fallback",
+                description=task,
+                phase_type=PhaseType.STRUCTURED,
+                dependencies=[],
+                config={}
+            )]
         return [
             HybridPhase(
                 id=p["id"],
@@ -588,11 +609,17 @@ Return a JSON array of phases:
         }
 
     async def aggregate(self, context: dict, task: str) -> Any:
-        """Aggregate results from all phases."""
+        """Aggregate results from all phases.
+
+        # Placeholder: Override to provide meaningful aggregation.
+        """
         return {"context": context, "task": task}
 
     async def summarize_swarm_findings(self, result: Any) -> str:
-        """Summarize swarm exploration findings."""
+        """Summarize swarm exploration findings.
+
+        # Placeholder: Override to extract insights from swarm results.
+        """
         return "Summary of swarm findings"
 
 
@@ -739,12 +766,13 @@ Any recommendation that violates these constraints is unacceptable.
     ) -> "CouncilDecision | None":
         """Try to modify decision to comply with constraints."""
 
+        violations_text = '\n'.join(f'- {v}' for v in violations)
         remediation_prompt = f"""
 The council reached this decision:
 {decision.decision}
 
 However, it violates these constraints:
-{chr(10).join(f'- {v}' for v in violations)}
+{violations_text}
 
 Propose a modified decision that:
 1. Preserves the core intent of the original decision
@@ -776,11 +804,17 @@ respond with "CANNOT_REMEDIATE".
         )
 
     def augment_question_with_constraints(self, question: str) -> str:
-        """Augment question with constraint information."""
+        """Augment question with constraint information.
+
+        # Placeholder: Override to add constraint context to questions.
+        """
         return question
 
     def generate_audit_trail(self, decision: Any, validation: Any) -> list:
-        """Generate audit trail for the decision."""
+        """Generate audit trail for the decision.
+
+        # Placeholder: Override to generate comprehensive audit logs.
+        """
         return []
 
 
@@ -1313,7 +1347,7 @@ class TaskAnalyzer:
         except json.JSONDecodeError:
             logger.warning("Failed to parse task analysis, using defaults")
             characteristics = TaskCharacteristics()
-        except Exception as e:
+        except (ValueError, TypeError, KeyError) as e:
             logger.error(f"Task analysis failed: {e}")
             characteristics = TaskCharacteristics()
 
@@ -1929,55 +1963,119 @@ Create a cohesive final output addressing the original task.
 
 
 # =============================================================================
-# Stub Classes for Type Hints (would be imported from other chapters)
+# Stub Classes for Type Hints
+# =============================================================================
+# IMPORTANT: These are PLACEHOLDER stubs for type hints and testing only.
+# In production, import the real implementations:
+#
+#   from ch05_orchestrator.orchestrator import SimpleOrchestrator, MultiAgentOrchestrator
+#   from ch06_council.council import Council
+#   from ch07_swarm.swarm import SwarmCoordinator
+#   from ch08_guardian.guardian import GuardianPipeline
+#
+# These stubs allow this module to run standalone for demonstration purposes.
 # =============================================================================
 
 class Orchestrator:
-    """Stub for Orchestrator pattern (from Chapter 5)."""
+    """Stub for Orchestrator pattern.
+
+    PLACEHOLDER: In production, import from ch05-orchestrator/orchestrator.py:
+        from ch05_orchestrator.orchestrator import SimpleOrchestrator as Orchestrator
+    """
     def __init__(self, llm=None, workers=None):
         self.llm = llm
         self.workers = workers or {}
 
     async def plan(self, task: str) -> dict:
+        """Plan task execution. # Placeholder: Returns empty dict."""
         return {}
 
     def create_execution_plan(self, subtasks: dict) -> list:
+        """Create execution plan. # Placeholder: Returns empty list."""
         return []
 
     async def execute_subtask(self, subtask: Any, context: dict) -> Any:
+        """Execute a subtask. # Placeholder: Returns empty dict."""
         return {}
 
     async def aggregate(self, results: dict, task: str) -> Any:
+        """Aggregate results. # Placeholder: Returns results unchanged."""
         return results
 
 
+@dataclass
+class ValidationResponse:
+    """Response from Guardian validation methods."""
+    result: ValidationResult = ValidationResult.APPROVED
+    reason: str = ""
+    modified_input: str = ""
+    modified_plan: Any = None
+    modified_results: Any = None
+
+
+@dataclass
+class ApprovalResponse:
+    """Response from Guardian approval methods."""
+    approved: bool = True
+    reason: str = ""
+
+
+@dataclass
+class QuestionCheckResponse:
+    """Response from Guardian question check."""
+    allowed: bool = True
+    violations: list[str] = field(default_factory=list)
+
+
+@dataclass
+class DecisionValidationResponse:
+    """Response from Guardian decision validation."""
+    compliant: bool = True
+    checks: list[str] = field(default_factory=list)
+    violations: list[str] = field(default_factory=list)
+
+
 class Guardian:
-    """Stub for Guardian pattern (from Chapter 8)."""
-    async def validate_input(self, task: str) -> Any:
-        return type('obj', (object,), {'result': ValidationResult.APPROVED})()
+    """Stub for Guardian pattern (from Chapter 8).
 
-    async def validate_plan(self, subtasks: dict) -> Any:
-        return type('obj', (object,), {'result': ValidationResult.APPROVED})()
+    In production, import from ch08-guardian/guardian.py
+    """
+    async def validate_input(self, task: str) -> ValidationResponse:
+        """Validate input. Placeholder: Always approves."""
+        return ValidationResponse(result=ValidationResult.APPROVED)
 
-    async def validate_results(self, results: dict) -> Any:
-        return type('obj', (object,), {'result': ValidationResult.APPROVED})()
+    async def validate_plan(self, subtasks: dict) -> ValidationResponse:
+        """Validate plan. Placeholder: Always approves."""
+        return ValidationResponse(result=ValidationResult.APPROVED)
 
-    async def approve_action(self, name: str, arguments: dict) -> Any:
-        return type('obj', (object,), {'approved': True})()
+    async def validate_results(self, results: dict) -> ValidationResponse:
+        """Validate results. Placeholder: Always approves."""
+        return ValidationResponse(result=ValidationResult.APPROVED)
 
-    async def validate_action_result(self, name: str, result: Any) -> Any:
-        return type('obj', (object,), {'result': ValidationResult.APPROVED})()
+    async def approve_action(self, name: str, arguments: dict) -> ApprovalResponse:
+        """Approve action. Placeholder: Always approves."""
+        return ApprovalResponse(approved=True)
 
-    async def check_question(self, question: str, constraints: list) -> Any:
-        return type('obj', (object,), {'allowed': True})()
+    async def validate_action_result(self, name: str, result: Any) -> ValidationResponse:
+        """Validate action result. Placeholder: Always approves."""
+        return ValidationResponse(result=ValidationResult.APPROVED)
 
-    async def validate_decision(self, decision: Any, constraints: list) -> Any:
-        return type('obj', (object,), {'compliant': True, 'checks': []})()
+    async def check_question(self, question: str, constraints: list) -> QuestionCheckResponse:
+        """Check question. Placeholder: Always allows."""
+        return QuestionCheckResponse(allowed=True)
+
+    async def validate_decision(self, decision: Any, constraints: list) -> DecisionValidationResponse:
+        """Validate decision. Placeholder: Always compliant."""
+        return DecisionValidationResponse(compliant=True, checks=[])
 
 
 class SwarmCoordinator:
-    """Stub for Swarm pattern (from Chapter 7)."""
+    """Stub for Swarm pattern (from Chapter 7).
+
+    # Placeholder: In production, import from ch07-swarm/swarm.py
+    """
     async def run(self, goal: str, max_steps: int = 100) -> Any:
+        """Run swarm exploration. # Placeholder: Returns empty results."""
         return type('obj', (object,), {
             'artifacts': [],
             'exploration_map': {}
@@ -1985,12 +2083,16 @@ class SwarmCoordinator:
 
 
 class Council:
-    """Stub for Council pattern (from Chapter 6)."""
+    """Stub for Council pattern (from Chapter 6).
+
+    # Placeholder: In production, import from ch06-council/council.py
+    """
     def __init__(self, councilors=None, llm=None):
         self.councilors = councilors or []
         self.llm = llm
 
     async def deliberate(self, question: str, context: dict = None) -> Any:
+        """Deliberate on question. # Placeholder: Returns empty decision."""
         return type('obj', (object,), {
             'decision': None,
             'transcript': []
@@ -1998,14 +2100,20 @@ class Council:
 
 
 class Subtask:
-    """Stub for Subtask."""
+    """Stub for Subtask.
+
+    # Placeholder: In production, import from ch05-orchestrator/orchestrator.py
+    """
     def __init__(self, id: str = "", worker_type: str = ""):
         self.id = id
         self.worker_type = worker_type
 
 
 class Artifact:
-    """Stub for Artifact."""
+    """Stub for Artifact.
+
+    # Placeholder: In production, define in shared types module
+    """
     def __init__(self, content: str = ""):
         self.content = content
 

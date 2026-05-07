@@ -17,6 +17,9 @@ httpx>=0.26
 openai>=1.12
 anthropic>=0.18
 
+# Embeddings (for swarm pattern, Chapter 7)
+sentence-transformers>=2.2
+
 # LangGraph for orchestration
 langgraph>=0.0.40
 
