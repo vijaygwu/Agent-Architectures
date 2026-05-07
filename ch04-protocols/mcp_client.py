@@ -14,6 +14,12 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+
+class MCPError(Exception):
+    """Error from MCP server."""
+    pass
+
+
 @dataclass
 class MCPTool:
     name: str
@@ -128,9 +134,6 @@ class MCPClient:
             except Exception:
                 pass  # Already terminated
 
-
-class MCPError(Exception):
-    pass
 
 async def demo():
     """Demonstrate MCP client usage."""

@@ -46,6 +46,11 @@ from dataclasses import dataclass, field
 from enum import Enum
 import uuid
 
+
+def _merge_dicts(a: dict, b: dict) -> dict:
+    """Merge two dictionaries, used for Annotated type reducer."""
+    return {**a, **b}
+
 # Import common utilities for structured logging
 import sys
 from pathlib import Path
@@ -194,7 +199,7 @@ class OrchestratorState(TypedDict):
     # Execution
     current_phase: int
     completed_subtasks: Annotated[list[str], operator.add]
-    results: Annotated[dict[str, Any], lambda a, b: {**a, **b}]
+    results: Annotated[dict[str, Any], _merge_dicts]
 
     # Output
     final_output: str | None

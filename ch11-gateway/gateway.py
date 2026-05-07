@@ -281,7 +281,10 @@ class RateLimitPolicy:
         self.max_requests = max_requests
         self.window_seconds = window_seconds
         self.scope = scope
-        self.requests: dict[str, list[datetime]] = defaultdict(list)
+        # Use deque with maxlen to bound memory; 2x max_requests provides headroom for cleanup
+        self.requests: dict[str, deque] = defaultdict(
+            lambda: deque(maxlen=max_requests * 2)
+        )
 
     def check(self, context: dict) -> tuple[bool, dict]:
         """Check if request is within rate limit."""

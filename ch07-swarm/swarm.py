@@ -113,7 +113,12 @@ def get_embedding(text: str) -> list[float]:
     if OPENAI_AVAILABLE:
         global _openai_client
         if _openai_client is None:
-            _openai_client = OpenAI(timeout=30.0)
+            try:
+                _openai_client = OpenAI(timeout=30.0)
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to create OpenAI client. Ensure OPENAI_API_KEY is set: {e}"
+                ) from e
         response = _openai_client.embeddings.create(
             input=text,
             model="text-embedding-3-small"

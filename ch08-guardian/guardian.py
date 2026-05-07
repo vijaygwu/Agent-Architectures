@@ -593,7 +593,11 @@ class CostGuardian(Guardian):
     def __init__(self, guardian_id: str, config: dict):
         super().__init__(guardian_id, config)
         self.budgets = config.get("budgets", {})
-        self.spending: dict[str, list[dict]] = defaultdict(list)
+        # Bound spending records to prevent unbounded memory growth
+        max_records = config.get("max_spending_records", 10000)
+        self.spending: dict[str, deque] = defaultdict(
+            lambda: deque(maxlen=max_records)
+        )
         self.cost_calculator = config.get("cost_calculator", self.default_cost_calculator)
 
     async def validate(self, action: ActionRequest) -> ValidationResult:
@@ -749,7 +753,11 @@ class SecurityGuardian(Guardian):
         self.permissions = config.get("permissions", {})
         self.blocked_patterns = config.get("blocked_patterns", [])
         self.rate_limits = config.get("rate_limits", {})
-        self.request_history: dict[str, list[datetime]] = defaultdict(list)
+        # Bound request history to prevent unbounded memory growth
+        max_history = config.get("max_request_history", 1000)
+        self.request_history: dict[str, deque] = defaultdict(
+            lambda: deque(maxlen=max_history)
+        )
 
     async def validate(self, action: ActionRequest) -> ValidationResult:
         """Comprehensive security validation."""

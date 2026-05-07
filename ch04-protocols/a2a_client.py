@@ -576,10 +576,10 @@ class A2AClient:
                 ),
                 timeout=30.0
             )
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as e:
             raise TimeoutError(
                 f"HTTP request timed out after 30 seconds obtaining OAuth token for {card.name}"
-            )
+            ) from e
         response.raise_for_status()
         return response.json()["access_token"]
 
