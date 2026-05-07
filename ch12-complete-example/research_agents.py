@@ -405,7 +405,7 @@ class AnalyzerAgent(ResearchAgent):
 
         for i, stmt in enumerate(base_statements[:2]):
             facts.append(Fact(
-                id=f"fact_{hashlib.sha256((source.id + str(i)).encode()).hexdigest()[:8]}",
+                id=f"fact_{uuid.uuid4().hex[:8]}",
                 statement=stmt,
                 sources=[source.id],
                 confidence=0.7 if source.credibility == SourceCredibility.HIGH else 0.5,

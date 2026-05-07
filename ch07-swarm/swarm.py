@@ -805,6 +805,13 @@ class HeterogeneousSwarm(Swarm):
                     self._pending_stops.append(asyncio.create_task(agent.stop()))
 
 
+    async def cleanup_pending_stops(self):
+        """Await all pending agent stop tasks to ensure clean shutdown."""
+        if hasattr(self, '_pending_stops') and self._pending_stops:
+            await asyncio.gather(*self._pending_stops, return_exceptions=True)
+            self._pending_stops.clear()
+
+
 class HierarchicalSwarm(Swarm):
     """Swarm with scouts, workers, and supervisors."""
 

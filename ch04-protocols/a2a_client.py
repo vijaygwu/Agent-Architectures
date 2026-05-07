@@ -239,7 +239,10 @@ class A2AClient:
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Close resources on context exit."""
-        await self.close()
+        try:
+            await self.close()
+        except Exception:
+            pass  # Ensure cleanup doesn't raise
 
     async def close(self):
         """Close HTTP client."""

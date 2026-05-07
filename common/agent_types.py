@@ -8,8 +8,10 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 
 
-# Default model - update this when new models are released
-DEFAULT_MODEL = "claude-sonnet-4"
+import os
+
+# Default model - configurable via environment variable
+DEFAULT_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4")
 
 
 class AgentRole(Enum):

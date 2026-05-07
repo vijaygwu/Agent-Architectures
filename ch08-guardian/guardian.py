@@ -850,10 +850,10 @@ class SecurityGuardian(Guardian):
         now = datetime.now(timezone.utc)
         cutoff = now - window
 
-        # Clean old requests
-        self.request_history[key] = [
-            t for t in self.request_history[key] if t > cutoff
-        ]
+        # Clean old requests while preserving deque maxlen
+        max_history = self.config.get("max_request_history", 1000)
+        filtered = [t for t in self.request_history[key] if t > cutoff]
+        self.request_history[key] = deque(filtered, maxlen=max_history)
 
         if len(self.request_history[key]) >= max_requests:
             return f"Rate limit exceeded: {max_requests} requests per {window.seconds}s"
@@ -1203,6 +1203,14 @@ class ResilientGuardianPipeline(GuardianPipeline):
 
         return self.aggregate_results(results, action)
 
+    async def shutdown(self):
+        """Cancel all pending health check tasks on shutdown."""
+        if hasattr(self, '_health_check_tasks'):
+            for task in self._health_check_tasks:
+                task.cancel()
+            await asyncio.gather(*self._health_check_tasks, return_exceptions=True)
+            self._health_check_tasks.clear()
+
     def mark_unhealthy(self, guardian_id: str):
         """Mark a guardian as unhealthy."""
         self.guardian_health[guardian_id] = False
@@ -1406,20 +1414,24 @@ class EscalationManager:
 
     async def timeout_ticket(self, ticket_id: str):
         """Timeout an unresolved ticket."""
-        await asyncio.sleep(self.timeout_hours * 3600)
+        try:
+            await asyncio.sleep(self.timeout_hours * 3600)
 
-        ticket = self.tickets.get(ticket_id)
-        if ticket and ticket.status == "pending":
-            ticket.status = "expired"
+            ticket = self.tickets.get(ticket_id)
+            if ticket and ticket.status == "pending":
+                ticket.status = "expired"
 
-            result = ValidationResult(
-                decision=GuardianDecision.DENY,
-                reason="Escalation timed out without review",
-                violations=["Review timeout"]
-            )
+                result = ValidationResult(
+                    decision=GuardianDecision.DENY,
+                    reason="Escalation timed out without review",
+                    violations=["Review timeout"]
+                )
 
-            if ticket_id in self.pending_actions:
-                self.pending_actions[ticket_id].set_result(result)
+                if ticket_id in self.pending_actions:
+                    self.pending_actions[ticket_id].set_result(result)
+        finally:
+            # Clean up task reference to prevent memory growth
+            self._timeout_tasks.pop(ticket_id, None)
 
 
 class GuardedExecutorWithEscalation(GuardedExecutor):

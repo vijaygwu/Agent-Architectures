@@ -362,6 +362,14 @@ class CouncilMember:
                 )
             self.client = AsyncAnthropic()
 
+    async def __aenter__(self):
+        """Support async context manager for standalone usage."""
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Close resources on context exit."""
+        await self.close()
+
     async def close(self):
         """Close the client connection to prevent resource leaks."""
         if self.client:

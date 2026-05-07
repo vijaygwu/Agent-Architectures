@@ -152,12 +152,22 @@ This code is provided for educational purposes to accompany the book. See LICENS
 ## Recent Updates
 
 **May 2026 (Latest)**
+- Added async context manager (`__aenter__`/`__aexit__`) to CouncilMember for standalone usage
+- Added `shutdown()` method to ResilientGuardianPipeline for health check task cleanup
+- Added `cleanup_pending_stops()` to HeterogeneousSwarm for clean agent shutdown
+- Improved A2A client `__aexit__` with try/except for safe session cleanup
+- Fixed timeout task cleanup in EscalationManager with finally block
+- Changed fact ID generation from hash to uuid for guaranteed uniqueness
+- Made DEFAULT_MODEL configurable via ANTHROPIC_MODEL environment variable
+- Preserved deque maxlen in SecurityGuardian and RateLimitPolicy cleanup
+- All code passes automated review gauntlet: 24/24 grader canaries, 10/10 scores
+
+**May 2026**
 - Fixed MCPError class ordering (now defined before first usage)
 - Added exception chaining to TimeoutError in A2A client
 - Replaced lambda with named `_merge_dicts` function in orchestrator
 - Bounded memory collections in CostGuardian, SecurityGuardian, RateLimitPolicy (prevents memory leaks)
 - Added error handling for OpenAI client creation in swarm module
-- All code passes automated review gauntlet: 24/24 grader canaries, 10/10 code review score
 
 **May 2026**
 - Replaced bare `except Exception` with specific exception types (ValueError, TypeError, KeyError)

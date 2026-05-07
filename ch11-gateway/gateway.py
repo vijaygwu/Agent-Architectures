@@ -292,11 +292,9 @@ class RateLimitPolicy:
         now = datetime.now(timezone.utc)
         window_start = now - timedelta(seconds=self.window_seconds)
 
-        # Clean old requests
-        self.requests[key] = [
-            t for t in self.requests[key]
-            if t > window_start
-        ]
+        # Clean old requests while preserving deque maxlen
+        filtered = [t for t in self.requests[key] if t > window_start]
+        self.requests[key] = deque(filtered, maxlen=self.max_requests * 2)
 
         if len(self.requests[key]) >= self.max_requests:
             retry_after = (self.requests[key][0] - window_start).total_seconds()
