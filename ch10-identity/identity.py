@@ -15,15 +15,188 @@ This module provides:
 7. Security best practices
 """
 
+__all__ = [
+    "PerAgentRateLimiter",
+    "TokenRateLimitExceeded",
+    "AgentToken",
+    "SimpleTokenAuth",
+    "ScopedToken",
+    "ScopedAuth",
+    "JWTAuth",
+    "AsymmetricJWTAuth",
+    "IdentityType",
+    "Identity",
+    "AgentRole",
+    "AgentIdentity",
+    "TokenInfo",
+    "IdentityService",
+    "AuthenticationError",
+    "AuthorizationError",
+    "AuthMiddleware",
+    "AuthenticatedAgent",
+    "TokenManager",
+    "AuditEntry",
+    "AuditLog",
+    "SecureAgent",
+    "HierarchicalIdentityService",
+    "ImpersonationService",
+    "DelegationGrant",
+    "DelegationService",
+    "LeastPrivilegeAssigner",
+    "SecureTokenStorage",
+    "CredentialRotator",
+]
+
 import asyncio
 import hashlib
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from secrets import token_urlsafe
 from typing import Any
 import json
+
+
+# =============================================================================
+# Rate Limiting for Token Issuance
+# =============================================================================
+
+class PerAgentRateLimiter:
+    """Rate limiter that tracks limits per agent ID."""
+
+    def __init__(self, max_requests: int = 10, window_seconds: float = 60.0):
+        """Initialize per-agent rate limiter.
+
+        Args:
+            max_requests: Maximum requests per agent per window (default: 10 per minute).
+            window_seconds: Time window in seconds.
+        """
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self._agent_requests: dict[str, list[float]] = {}
+
+    def allow(self, agent_id: str) -> bool:
+        """Check if a request is allowed for the given agent.
+
+        Args:
+            agent_id: The agent ID to check rate limit for.
+
+        Returns:
+            True if the request is allowed, False otherwise.
+        """
+        now = time.time()
+
+        # Initialize if needed
+        if agent_id not in self._agent_requests:
+            self._agent_requests[agent_id] = []
+
+        # Remove expired timestamps
+        self._agent_requests[agent_id] = [
+            t for t in self._agent_requests[agent_id]
+            if now - t < self.window_seconds
+        ]
+
+        if len(self._agent_requests[agent_id]) < self.max_requests:
+            self._agent_requests[agent_id].append(now)
+            return True
+        return False
+
+    def reset(self, agent_id: str | None = None):
+        """Reset rate limiter for a specific agent or all agents.
+
+        Args:
+            agent_id: If provided, reset only this agent. Otherwise reset all.
+        """
+        if agent_id:
+            self._agent_requests.pop(agent_id, None)
+        else:
+            self._agent_requests.clear()
+
+
+class TokenRateLimitExceeded(Exception):
+    """Exception raised when token issuance rate limit is exceeded."""
+    pass
+
+# =============================================================================
+# Metrics Collection
+# =============================================================================
+
+try:
+    from common.metrics import MetricsCollector
+    _identity_metrics = MetricsCollector(namespace="identity")
+except ImportError:
+    _identity_metrics = None
+
+# =============================================================================
+# Circuit Breaker for Identity Operations
+# =============================================================================
+
+try:
+    from common.resilience import CircuitBreaker, CircuitBreakerOpen
+    _identity_circuit_breaker = CircuitBreaker(
+        name="identity_service",
+        failure_threshold=5,
+        recovery_timeout=60.0
+    )
+except ImportError:
+    # Inline fallback implementation
+    class CircuitBreakerOpen(Exception):
+        """Exception raised when circuit breaker is open."""
+        def __init__(self, breaker_name: str, time_until_retry: float):
+            self.breaker_name = breaker_name
+            self.time_until_retry = time_until_retry
+            super().__init__(
+                f"Circuit breaker '{breaker_name}' is OPEN. "
+                f"Retry in {time_until_retry:.1f}s"
+            )
+
+    class CircuitBreaker:
+        """Minimal fallback circuit breaker."""
+        def __init__(self, name: str, failure_threshold: int = 5, recovery_timeout: float = 60.0):
+            self.name = name
+            self.failure_threshold = failure_threshold
+            self.recovery_timeout = recovery_timeout
+            self._failure_count = 0
+            self._last_failure_time = 0.0
+            self._is_open = False
+
+        def _check_state(self):
+            if self._is_open:
+                elapsed = time.time() - self._last_failure_time
+                if elapsed >= self.recovery_timeout:
+                    self._is_open = False
+                    self._failure_count = 0
+                else:
+                    raise CircuitBreakerOpen(self.name, self.recovery_timeout - elapsed)
+
+        def record_success(self):
+            self._failure_count = 0
+            self._is_open = False
+
+        def record_failure(self):
+            self._failure_count += 1
+            self._last_failure_time = time.time()
+            if self._failure_count >= self.failure_threshold:
+                self._is_open = True
+
+        async def __aenter__(self):
+            self._check_state()
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            if exc_type is not None:
+                self.record_failure()
+            else:
+                self.record_success()
+            return False
+
+    _identity_circuit_breaker = CircuitBreaker(
+        name="identity_service",
+        failure_threshold=5,
+        recovery_timeout=60.0
+    )
 
 try:
     import jwt
@@ -214,10 +387,10 @@ class AsymmetricJWTAuth:
                 private_key_pem, password=None
             )
         else:
-            # Generate new key pair
+            # Generate new key pair (3072 bits per NIST SP 800-57)
             self.private_key = rsa.generate_private_key(
                 public_exponent=65537,
-                key_size=2048
+                key_size=3072
             )
 
         self.public_key = self.private_key.public_key() if self.private_key else (
@@ -319,11 +492,24 @@ class IdentityService:
     - JWT token issuance and verification
     - Token revocation with automatic expiry cleanup
     - Scope-based authorization
+    - Per-agent rate limiting on token issuance (10 tokens/min/agent)
 
     Requires: pip install PyJWT
     """
 
-    def __init__(self, secret_key: str, issuer: str = "agent-system"):
+    def __init__(self, secret_key: str, issuer: str = "agent-system",
+                 max_agents: int = 10000, max_tokens: int = 100000,
+                 token_rate_limit: int = 10, rate_limit_window: float = 60.0):
+        """Initialize the identity service.
+
+        Args:
+            secret_key: Secret key for JWT signing.
+            issuer: Token issuer identifier.
+            max_agents: Maximum number of registered agents.
+            max_tokens: Maximum number of active tokens.
+            token_rate_limit: Max token issuances per agent per window (default: 10).
+            rate_limit_window: Rate limit window in seconds (default: 60.0).
+        """
         if not JWT_AVAILABLE:
             raise ImportError(
                 "PyJWT is required for IdentityService. Install with: pip install PyJWT"
@@ -332,8 +518,15 @@ class IdentityService:
         self.issuer = issuer
         self.agents: dict[str, AgentIdentity] = {}
         self.tokens: dict[str, TokenInfo] = {}
+        self._max_agents = max_agents
+        self._max_tokens = max_tokens
         # Store revoked tokens with their expiry time for cleanup
         self._revoked_tokens: dict[str, datetime] = {}
+        # Per-agent rate limiter for token issuance
+        self._token_rate_limiter = PerAgentRateLimiter(
+            max_requests=token_rate_limit,
+            window_seconds=rate_limit_window
+        )
         logger.info(f"IdentityService initialized with issuer: {issuer}")
 
     @property
@@ -374,6 +567,8 @@ class IdentityService:
             metadata=metadata or {}
         )
 
+        if len(self.agents) >= self._max_agents:
+            raise ValueError(f"Maximum agents ({self._max_agents}) reached")
         self.agents[agent_id] = identity
         logger.info(f"Registered agent: {name} ({agent_id}) with role {role.value}")
         return identity
@@ -419,9 +614,31 @@ class IdentityService:
         self,
         agent_id: str,
         ttl_hours: int = 24,
-        additional_claims: dict | None = None
+        additional_claims: dict | None = None,
+        bypass_rate_limit: bool = False
     ) -> str | None:
-        """Issue a JWT token for an agent."""
+        """Issue a JWT token for an agent.
+
+        Args:
+            agent_id: The agent ID to issue a token for.
+            ttl_hours: Token time-to-live in hours (default: 24).
+            additional_claims: Optional additional JWT claims.
+            bypass_rate_limit: If True, skip rate limiting (for internal use).
+
+        Returns:
+            The issued JWT token, or None if agent not found.
+
+        Raises:
+            TokenRateLimitExceeded: If rate limit is exceeded for this agent.
+        """
+        # Check per-agent rate limit (10 tokens per minute per agent)
+        if not bypass_rate_limit and not self._token_rate_limiter.allow(agent_id):
+            logger.warning(f"Token issuance rate limit exceeded for agent {agent_id}")
+            raise TokenRateLimitExceeded(
+                f"Rate limit exceeded for agent {agent_id}. "
+                "Maximum 10 tokens per minute allowed."
+            )
+
         identity = self.agents.get(agent_id)
         if not identity:
             logger.warning(f"Token issuance failed: agent {agent_id} not found")
@@ -443,7 +660,13 @@ class IdentityService:
 
         token = jwt.encode(payload, self.secret_key, algorithm="HS256")
 
-        # Track token for revocation
+        # Track token for revocation (with cleanup of expired tokens)
+        if len(self.tokens) >= self._max_tokens:
+            # Remove expired tokens
+            expired = [tid for tid, info in self.tokens.items()
+                      if info.expires_at < now]
+            for tid in expired:
+                del self.tokens[tid]
         self.tokens[token_id] = TokenInfo(
             token_id=token_id,
             agent_id=agent_id,
@@ -452,10 +675,19 @@ class IdentityService:
         )
 
         logger.info(f"Issued token for agent {agent_id}, expires in {ttl_hours} hours")
+
+        # Track metrics
+        if _identity_metrics:
+            _identity_metrics.increment("tokens_issued", labels={"role": identity.role.value})
+
         return token
 
     def verify_token(self, token: str) -> dict | None:
         """Verify a token and return its claims."""
+        start_time = time.time()
+        result = None
+        status = "success"
+
         try:
             payload = jwt.decode(
                 token,
@@ -468,16 +700,26 @@ class IdentityService:
             token_id = payload.get("jti")
             if token_id in self.revoked_tokens:
                 logger.warning(f"Token {token_id} has been revoked")
+                status = "revoked"
                 return None
 
+            result = payload
             return payload
 
         except jwt.ExpiredSignatureError:
             logger.warning("Token verification failed: expired")
+            status = "expired"
             return None
         except jwt.InvalidTokenError as e:
             logger.warning(f"Token verification failed: {e}")
+            status = "invalid"
             return None
+        finally:
+            # Track metrics
+            if _identity_metrics:
+                latency = time.time() - start_time
+                _identity_metrics.increment("token_validations", labels={"status": status})
+                _identity_metrics.observe("validation_latency", latency)
 
     def revoke_token(self, token: str):
         """Revoke a specific token."""
@@ -489,6 +731,10 @@ class IdentityService:
                 exp = datetime.fromtimestamp(payload.get("exp", 0), tz=timezone.utc)
                 self._revoked_tokens[payload["jti"]] = exp
                 logger.info(f"Revoked token {payload['jti']}")
+
+                # Track metrics
+                if _identity_metrics:
+                    _identity_metrics.increment("tokens_revoked")
         except jwt.InvalidTokenError:
             pass  # Invalid token, nothing to revoke
 
@@ -552,7 +798,13 @@ class AuthMiddleware:
         self.identity_service = identity_service
 
     async def authenticate(self, request: dict) -> AgentIdentity | None:
-        """Authenticate a request and return the agent identity."""
+        """Authenticate a request and return the agent identity.
+
+        Uses circuit breaker to fail fast if identity service is degraded.
+
+        Raises:
+            CircuitBreakerOpen: If identity service circuit breaker is open.
+        """
         # Get token from header
         auth_header = request.get("headers", {}).get("Authorization", "")
 
@@ -560,7 +812,10 @@ class AuthMiddleware:
             return None
 
         token = auth_header[7:]  # Remove "Bearer " prefix
-        return self.identity_service.get_agent_from_token(token)
+
+        # Use circuit breaker for token validation
+        async with _identity_circuit_breaker:
+            return self.identity_service.get_agent_from_token(token)
 
     def require_scope(self, scope: str):
         """Decorator to require a specific scope."""
@@ -611,6 +866,7 @@ class TokenManager:
         self.agent_id = agent_id
         self.current_token: str | None = None
         self.refresh_threshold = timedelta(hours=1)
+        self._shutdown = False
 
     async def get_token(self) -> str:
         """Get a valid token, refreshing if needed."""
@@ -626,11 +882,16 @@ class TokenManager:
         logger.info(f"Refreshed token for agent {self.agent_id}")
         return self.current_token
 
+    def stop(self):
+        """Signal the refresh loop to stop."""
+        self._shutdown = True
+
     async def refresh_loop(self):
         """Background task to keep token fresh."""
-        while True:
+        while not self._shutdown:
             await asyncio.sleep(3600)  # Check every hour
-            await self.get_token()
+            if not self._shutdown:
+                await self.get_token()
 
 
 # =============================================================================

@@ -19,21 +19,257 @@ Production Notes:
 - Store audit logs in append-only storage for compliance
 """
 
+__all__ = [
+    "GuardianConfig",
+    "MetricsExporter",
+    "SecurityMetrics",
+    "InMemoryMetricsExporter",
+    "ValidationError",
+    "GuardianDecision",
+    "ValidationResult",
+    "ActionRequest",
+    "Guardian",
+    "GuardianPipeline",
+    "GuardedExecutor",
+    "ContentPolicy",
+    "ContentGuardian",
+    "ActionGuardian",
+    "CostGuardian",
+    "SecurityGuardian",
+    "CircuitState",
+    "CircuitConfig",
+    "CircuitBreaker",
+    "CircuitBreakerGuardian",
+    "create_defense_in_depth_pipeline",
+    "ResilientGuardianPipeline",
+    "FailurePolicy",
+    "create_production_pipeline",
+    "EscalationTicket",
+    "EscalationManager",
+    "GuardedExecutorWithEscalation",
+    "GuardianMonitor",
+    "create_guardian_dashboard",
+]
+
 import asyncio
 import hashlib
 import json
 import logging
+import os
 import re
 from abc import ABC, abstractmethod
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
 
 # Configure logging for audit trail
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("guardian")
+
+
+# =============================================================================
+# Guardian Configuration (Environment-Configurable)
+# =============================================================================
+
+@dataclass
+class GuardianConfig:
+    """Externally configurable thresholds for guardian alerting and circuit breakers.
+
+    All values can be overridden via environment variables:
+        GUARDIAN_ALERT_THRESHOLD: Escalation spike threshold for alerts
+        GUARDIAN_MAX_VIOLATIONS: Max violations per minute before alerting
+        GUARDIAN_CB_THRESHOLD: Circuit breaker failure threshold
+        GUARDIAN_ESCALATION_TIMEOUT: Escalation timeout in seconds
+    """
+    alert_threshold: int = int(os.environ.get("GUARDIAN_ALERT_THRESHOLD", "10"))
+    max_violations_per_minute: int = int(os.environ.get("GUARDIAN_MAX_VIOLATIONS", "100"))
+    circuit_breaker_threshold: int = int(os.environ.get("GUARDIAN_CB_THRESHOLD", "5"))
+    escalation_timeout: float = float(os.environ.get("GUARDIAN_ESCALATION_TIMEOUT", "300.0"))
+
+    def __post_init__(self):
+        """Validate configuration values."""
+        if self.alert_threshold <= 0:
+            raise ValueError("Alert threshold must be positive")
+        if self.max_violations_per_minute <= 0:
+            raise ValueError("Max violations per minute must be positive")
+        if self.circuit_breaker_threshold <= 0:
+            raise ValueError("Circuit breaker threshold must be positive")
+        if self.escalation_timeout <= 0:
+            raise ValueError("Escalation timeout must be positive")
+
+
+# =============================================================================
+# Metrics Export Protocol and Implementation
+# =============================================================================
+
+class MetricsExporter(Protocol):
+    """Protocol for exporting security metrics to external systems.
+
+    Implement this protocol to integrate with your monitoring stack:
+    - Prometheus: Use prometheus_client library
+    - DataDog: Use datadog library
+    - SIEM systems: Format events appropriately
+
+    Example implementation for Prometheus:
+        class PrometheusMetricsExporter:
+            def __init__(self):
+                from prometheus_client import Counter, Histogram
+                self.events_total = Counter(
+                    'security_events_total',
+                    'Total security events',
+                    ['severity', 'event_type']
+                )
+                self.violations_by_type = Counter(
+                    'security_violations_total',
+                    'Violations by type',
+                    ['violation_type']
+                )
+
+            async def record_security_event(self, event: dict) -> None:
+                self.events_total.labels(
+                    severity=event['severity'],
+                    event_type=event['action_type']
+                ).inc()
+    """
+
+    async def record_security_event(self, event: dict) -> None:
+        """Record a security event for metrics/monitoring.
+
+        Args:
+            event: Security event dict with keys:
+                - timestamp: ISO format timestamp
+                - severity: 'low', 'medium', 'high', 'critical'
+                - agent_id: ID of the agent that triggered the event
+                - action_type: Type of action attempted
+                - violations: List of violation descriptions
+                - request_id: Unique request identifier
+                - parameters_hash: SHA256 hash of request parameters
+        """
+        ...
+
+    async def increment_counter(self, name: str, labels: dict[str, str]) -> None:
+        """Increment a named counter with labels."""
+        ...
+
+    async def record_histogram(self, name: str, value: float, labels: dict[str, str]) -> None:
+        """Record a value in a histogram metric."""
+        ...
+
+
+@dataclass
+class SecurityMetrics:
+    """Aggregated security metrics for reporting."""
+    security_events_total: int = 0
+    violations_by_type: dict[str, int] = field(default_factory=dict)
+    actions_blocked: int = 0
+    actions_approved: int = 0
+    escalations: int = 0
+    events_by_severity: dict[str, int] = field(default_factory=lambda: {
+        "low": 0, "medium": 0, "high": 0, "critical": 0
+    })
+
+    def to_dict(self) -> dict:
+        """Convert metrics to dictionary for export."""
+        return {
+            "security_events_total": self.security_events_total,
+            "violations_by_type": self.violations_by_type,
+            "actions_blocked": self.actions_blocked,
+            "actions_approved": self.actions_approved,
+            "escalations": self.escalations,
+            "events_by_severity": self.events_by_severity
+        }
+
+    def to_siem_format(self) -> list[dict]:
+        """Export metrics in SIEM-compatible format (CEF-like)."""
+        return [
+            {
+                "event_type": "security_metrics_summary",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "metrics": self.to_dict(),
+                "format_version": "1.0"
+            }
+        ]
+
+
+class InMemoryMetricsExporter:
+    """In-memory metrics exporter for testing and development.
+
+    Usage:
+        exporter = InMemoryMetricsExporter()
+        guardian = SecurityGuardian("security", config, metrics_exporter=exporter)
+
+        # After some operations...
+        metrics = exporter.get_metrics()
+        print(f"Total events: {metrics.security_events_total}")
+        print(f"Blocked actions: {metrics.actions_blocked}")
+    """
+
+    def __init__(self):
+        self.metrics = SecurityMetrics()
+        self.events: list[dict] = []
+        self._lock = asyncio.Lock()
+
+    async def record_security_event(self, event: dict) -> None:
+        """Record a security event."""
+        async with self._lock:
+            self.events.append(event)
+            self.metrics.security_events_total += 1
+
+            severity = event.get("severity", "medium")
+            if severity in self.metrics.events_by_severity:
+                self.metrics.events_by_severity[severity] += 1
+
+            for violation in event.get("violations", []):
+                # Extract violation type from violation message
+                violation_type = self._extract_violation_type(violation)
+                self.metrics.violations_by_type[violation_type] = (
+                    self.metrics.violations_by_type.get(violation_type, 0) + 1
+                )
+
+    async def increment_counter(self, name: str, labels: dict[str, str]) -> None:
+        """Increment a named counter."""
+        async with self._lock:
+            if name == "actions_blocked":
+                self.metrics.actions_blocked += 1
+            elif name == "actions_approved":
+                self.metrics.actions_approved += 1
+            elif name == "escalations":
+                self.metrics.escalations += 1
+
+    async def record_histogram(self, name: str, value: float, labels: dict[str, str]) -> None:
+        """Record histogram value (no-op for in-memory exporter)."""
+        pass
+
+    def _extract_violation_type(self, violation: str) -> str:
+        """Extract a violation type category from violation message."""
+        violation_lower = violation.lower()
+        if "injection" in violation_lower:
+            return "injection"
+        elif "rate limit" in violation_lower:
+            return "rate_limit"
+        elif "permission" in violation_lower:
+            return "permission"
+        elif "sensitive" in violation_lower:
+            return "sensitive_data"
+        elif "traversal" in violation_lower:
+            return "path_traversal"
+        else:
+            return "other"
+
+    def get_metrics(self) -> SecurityMetrics:
+        """Get current metrics snapshot."""
+        return self.metrics
+
+    def get_events(self) -> list[dict]:
+        """Get all recorded events."""
+        return self.events.copy()
+
+    def reset(self) -> None:
+        """Reset all metrics and events."""
+        self.metrics = SecurityMetrics()
+        self.events = []
 
 
 # =============================================================================
@@ -266,6 +502,8 @@ class ContentGuardian(Guardian):
     """Validates text content against policies."""
 
     def __init__(self, guardian_id: str, llm_client=None, policies: list[ContentPolicy] = None):
+        if not guardian_id or not guardian_id.strip():
+            raise ValueError("Guardian ID must not be empty")
         super().__init__(guardian_id)
         self.llm = llm_client
         self.policies = policies or self.default_policies()
@@ -487,6 +725,8 @@ class ActionGuardian(Guardian):
     """Validates actions against operational policies."""
 
     def __init__(self, guardian_id: str, action_policies: dict[str, dict]):
+        if not guardian_id or not guardian_id.strip():
+            raise ValueError("Guardian ID must not be empty")
         super().__init__(guardian_id)
         self.action_policies = action_policies
 
@@ -591,8 +831,14 @@ class CostGuardian(Guardian):
     """Monitors and limits costs across the system."""
 
     def __init__(self, guardian_id: str, config: dict):
+        if not guardian_id or not guardian_id.strip():
+            raise ValueError("Guardian ID must not be empty")
         super().__init__(guardian_id, config)
         self.budgets = config.get("budgets", {})
+        # Validate budget values are positive
+        for budget_key, budget_value in self.budgets.items():
+            if isinstance(budget_value, (int, float)) and budget_value < 0:
+                raise ValueError(f"Budget value for '{budget_key}' must be non-negative")
         # Bound spending records to prevent unbounded memory growth
         max_records = config.get("max_spending_records", 10000)
         self.spending: dict[str, deque] = defaultdict(
@@ -746,18 +992,60 @@ class CostGuardian(Guardian):
 # =============================================================================
 
 class SecurityGuardian(Guardian):
-    """Enforces security policies and detects threats."""
+    """Enforces security policies and detects threats.
 
-    def __init__(self, guardian_id: str, config: dict):
+    Supports optional metrics export for SIEM integration and observability.
+
+    Args:
+        guardian_id: Unique identifier for this guardian
+        config: Configuration dict with keys:
+            - permissions: Dict mapping agent_id to list of allowed actions
+            - blocked_patterns: List of {name, regex} patterns to block
+            - rate_limits: Dict mapping action_type to {window_seconds, max_requests}
+            - max_request_history: Max entries in request history (default 1000)
+        metrics_exporter: Optional MetricsExporter for external monitoring
+
+    Example:
+        from guardian import SecurityGuardian, InMemoryMetricsExporter
+
+        exporter = InMemoryMetricsExporter()
+        guardian = SecurityGuardian(
+            "security",
+            config={...},
+            metrics_exporter=exporter
+        )
+
+        # Later, check metrics
+        metrics = exporter.get_metrics()
+        print(f"Blocked: {metrics.actions_blocked}")
+    """
+
+    def __init__(
+        self,
+        guardian_id: str,
+        config: dict,
+        metrics_exporter: MetricsExporter | None = None
+    ):
         super().__init__(guardian_id, config)
         self.permissions = config.get("permissions", {})
         self.blocked_patterns = config.get("blocked_patterns", [])
         self.rate_limits = config.get("rate_limits", {})
+        # Validate rate limits are positive
+        for action_type, limit_config in self.rate_limits.items():
+            if isinstance(limit_config, dict):
+                window = limit_config.get("window_seconds")
+                max_req = limit_config.get("max_requests")
+                if window is not None and window <= 0:
+                    raise ValueError(f"Rate limit window_seconds for '{action_type}' must be positive")
+                if max_req is not None and max_req <= 0:
+                    raise ValueError(f"Rate limit max_requests for '{action_type}' must be positive")
         # Bound request history to prevent unbounded memory growth
         max_history = config.get("max_request_history", 1000)
         self.request_history: dict[str, deque] = defaultdict(
             lambda: deque(maxlen=max_history)
         )
+        # Optional metrics exporter for SIEM/monitoring integration
+        self._metrics_exporter = metrics_exporter
 
     async def validate(self, action: ActionRequest) -> ValidationResult:
         """Comprehensive security validation."""
@@ -911,7 +1199,17 @@ class SecurityGuardian(Guardian):
 
     async def log_security_event(self, action: ActionRequest,
                                  violations: list[str], severity: str):
-        """Log security events for monitoring."""
+        """Log security events for monitoring and export to metrics system.
+
+        Records the event to:
+        1. Local audit_log (always)
+        2. External metrics exporter if configured (SIEM, Prometheus, etc.)
+
+        Args:
+            action: The action request that triggered the security event
+            violations: List of violation descriptions
+            severity: Event severity ('low', 'medium', 'high', 'critical')
+        """
         event = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "severity": severity,
@@ -923,8 +1221,153 @@ class SecurityGuardian(Guardian):
                 json.dumps(action.parameters, sort_keys=True).encode()
             ).hexdigest()
         }
-        # In production, send to SIEM or security logging system
+
+        # Always log to local audit log
         self.audit_log.append(event)
+
+        # Export to external metrics/SIEM system if configured
+        if self._metrics_exporter:
+            try:
+                await self._metrics_exporter.record_security_event(event)
+                # Also increment the blocked actions counter
+                await self._metrics_exporter.increment_counter(
+                    "actions_blocked",
+                    {"severity": severity, "action_type": action.action_type}
+                )
+            except Exception as e:
+                # Don't let metrics export failure affect security operations
+                logger.warning(f"Failed to export security metrics: {e}")
+
+    async def record_approval(self, action: ActionRequest):
+        """Record an approved action for metrics tracking.
+
+        Call this when an action passes all security checks.
+        """
+        if self._metrics_exporter:
+            try:
+                await self._metrics_exporter.increment_counter(
+                    "actions_approved",
+                    {"action_type": action.action_type, "agent_id": action.agent_id}
+                )
+            except Exception as e:
+                logger.warning(f"Failed to export approval metrics: {e}")
+
+    def get_metrics_summary(self) -> dict:
+        """Get a summary of security metrics from the audit log.
+
+        Returns aggregated metrics suitable for dashboards or reporting.
+        For real-time metrics, use a MetricsExporter implementation.
+        """
+        events = list(self.audit_log)
+        summary = {
+            "total_events": len(events),
+            "events_by_severity": {"low": 0, "medium": 0, "high": 0, "critical": 0},
+            "violations_by_type": {},
+            "top_agents": {},
+            "top_action_types": {}
+        }
+
+        for event in events:
+            # Count by severity
+            severity = event.get("severity", "medium")
+            if severity in summary["events_by_severity"]:
+                summary["events_by_severity"][severity] += 1
+
+            # Count violations by type
+            for violation in event.get("violations", []):
+                vtype = self._categorize_violation(violation)
+                summary["violations_by_type"][vtype] = (
+                    summary["violations_by_type"].get(vtype, 0) + 1
+                )
+
+            # Count by agent
+            agent_id = event.get("agent_id", "unknown")
+            summary["top_agents"][agent_id] = (
+                summary["top_agents"].get(agent_id, 0) + 1
+            )
+
+            # Count by action type
+            action_type = event.get("action_type", "unknown")
+            summary["top_action_types"][action_type] = (
+                summary["top_action_types"].get(action_type, 0) + 1
+            )
+
+        return summary
+
+    def _categorize_violation(self, violation: str) -> str:
+        """Categorize a violation message into a type."""
+        violation_lower = violation.lower()
+        if "injection" in violation_lower:
+            return "injection"
+        elif "rate limit" in violation_lower:
+            return "rate_limit"
+        elif "permission" in violation_lower:
+            return "permission"
+        elif "sensitive" in violation_lower:
+            return "sensitive_data"
+        elif "traversal" in violation_lower:
+            return "path_traversal"
+        elif "blocked pattern" in violation_lower:
+            return "blocked_pattern"
+        else:
+            return "other"
+
+    def export_events_siem_format(self, since: datetime | None = None) -> list[dict]:
+        """Export security events in SIEM-compatible format.
+
+        Returns events formatted for ingestion by common SIEM systems.
+        Format follows CEF (Common Event Format) conventions.
+
+        Args:
+            since: Optional datetime to filter events after this time
+
+        Returns:
+            List of SIEM-formatted event dicts
+
+        Example:
+            events = guardian.export_events_siem_format(
+                since=datetime.now(timezone.utc) - timedelta(hours=1)
+            )
+            for event in events:
+                siem_client.send(event)
+        """
+        events = []
+        for audit_event in self.audit_log:
+            # Parse timestamp for filtering
+            event_time = datetime.fromisoformat(audit_event["timestamp"])
+            if since and event_time < since:
+                continue
+
+            # Map severity to CEF severity (0-10 scale)
+            severity_map = {"low": 2, "medium": 5, "high": 7, "critical": 10}
+            cef_severity = severity_map.get(audit_event.get("severity", "medium"), 5)
+
+            siem_event = {
+                # CEF header fields
+                "cef_version": "0",
+                "device_vendor": "AgentBook",
+                "device_product": "Guardian",
+                "device_version": "1.0",
+                "signature_id": f"GUARD-{audit_event.get('action_type', 'UNKNOWN')}",
+                "name": f"Security Event: {audit_event.get('action_type', 'unknown')}",
+                "severity": cef_severity,
+
+                # Extension fields
+                "timestamp": audit_event["timestamp"],
+                "source_user_id": audit_event.get("agent_id", "unknown"),
+                "request_id": audit_event.get("request_id", ""),
+                "action": audit_event.get("action_type", "unknown"),
+                "outcome": "blocked",
+                "reason": "; ".join(audit_event.get("violations", [])),
+                "parameters_hash": audit_event.get("parameters_hash", ""),
+
+                # Custom fields
+                "violation_count": len(audit_event.get("violations", [])),
+                "guardian_id": self.id
+            }
+            events.append(siem_event)
+
+        return events
 
 
 # =============================================================================
@@ -945,6 +1388,15 @@ class CircuitConfig:
     success_threshold: int = 3      # Successes to close from half-open
     timeout_seconds: float = 60.0   # Time before trying half-open
 
+    def __post_init__(self):
+        """Validate configuration values."""
+        if self.failure_threshold <= 0:
+            raise ValueError("Failure threshold must be positive")
+        if self.success_threshold <= 0:
+            raise ValueError("Success threshold must be positive")
+        if self.timeout_seconds <= 0:
+            raise ValueError("Timeout seconds must be positive")
+
 
 class CircuitBreaker:
     """Circuit breaker for system protection.
@@ -954,6 +1406,8 @@ class CircuitBreaker:
     """
 
     def __init__(self, name: str, config: CircuitConfig = None):
+        if not name or not name.strip():
+            raise ValueError("Circuit breaker name must not be empty")
         self.name = name
         self.config = config or CircuitConfig()
         self.state = CircuitState.CLOSED
@@ -1034,12 +1488,16 @@ class CircuitBreaker:
 class CircuitBreakerGuardian(Guardian):
     """Guardian that implements circuit breaker pattern."""
 
-    def __init__(self, guardian_id: str, breakers: dict[str, CircuitBreaker] = None):
+    def __init__(self, guardian_id: str, breakers: dict[str, CircuitBreaker] = None,
+                 config: GuardianConfig = None):
+        if not guardian_id or not guardian_id.strip():
+            raise ValueError("Guardian ID must not be empty")
         super().__init__(guardian_id)
+        self.guardian_config = config or GuardianConfig()
         self.breakers = breakers or {}
         self.global_breaker = CircuitBreaker("global", CircuitConfig(
-            failure_threshold=10,
-            timeout_seconds=300
+            failure_threshold=self.guardian_config.circuit_breaker_threshold,
+            timeout_seconds=self.guardian_config.escalation_timeout
         ))
 
     async def validate(self, action: ActionRequest) -> ValidationResult:
@@ -1343,6 +1801,8 @@ class EscalationManager:
     """Manages escalated actions requiring human review."""
 
     def __init__(self, notification_service, timeout_hours: int = 24):
+        if timeout_hours <= 0:
+            raise ValueError("Timeout hours must be positive")
         self.tickets: dict[str, EscalationTicket] = {}
         self.notification_service = notification_service
         self.timeout_hours = timeout_hours
@@ -1495,9 +1955,10 @@ class GuardedExecutorWithEscalation(GuardedExecutor):
 class GuardianMonitor:
     """Monitors guardian activity and health."""
 
-    def __init__(self, guardians: list[Guardian]):
+    def __init__(self, guardians: list[Guardian], config: GuardianConfig = None):
         self.guardians = {g.id: g for g in guardians}
         self.metrics: dict[str, list] = defaultdict(list)
+        self.config = config or GuardianConfig()
 
     def collect_metrics(self) -> dict:
         """Collect metrics from all guardians."""
@@ -1546,7 +2007,7 @@ class GuardianMonitor:
                 )
 
             # Spike in escalations
-            if m["escalations"] > 10:
+            if m["escalations"] > self.config.alert_threshold:
                 alerts.append(
                     f"Escalation spike ({m['escalations']}) for {guardian_id}"
                 )

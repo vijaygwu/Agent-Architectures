@@ -15,7 +15,30 @@ For production use, integrate with real APIs and search services.
 Handles research queries from planning through final report.
 """
 
+__all__ = [
+    "cosine_similarity",
+    "PercentileHistogram",
+    "SourceType",
+    "SourceCredibility",
+    "ResearchStatus",
+    "Source",
+    "Fact",
+    "ResearchSection",
+    "ResearchQuery",
+    "ResearchProject",
+    "ResearchAgent",
+    "PlannerAgent",
+    "GathererAgent",
+    "AnalyzerAgent",
+    "SynthesizerAgent",
+    "ValidatorAgent",
+    "ReportGenerator",
+    "ResearchOrchestrator",
+]
+
 import asyncio
+import logging
+import random
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -23,6 +46,105 @@ from enum import Enum
 from typing import Any, Optional
 from collections import defaultdict
 import hashlib
+import sys
+from pathlib import Path
+
+# Import structured logging from common utilities
+sys.path.insert(0, str(Path(__file__).parent.parent / "common"))
+try:
+    from utils import configure_logging
+    logger = configure_logging(level="INFO", json_output=True, logger_name="research_agents")
+except ImportError:
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger("research_agents")
+
+# Import metrics collection for duration tracking
+try:
+    from metrics import MetricsCollector, timed_block
+except ImportError:
+    # Fallback: define minimal stubs if metrics module unavailable
+    class MetricsCollector:
+        def __init__(self, namespace: str = "", default_labels: dict = None):
+            self.namespace = namespace
+        def observe(self, name: str, value: float, labels: dict = None):
+            pass
+        def export_json(self) -> dict:
+            return {}
+
+    from contextlib import asynccontextmanager
+    @asynccontextmanager
+    async def timed_block(metrics, metric_name: str, labels: dict = None):
+        yield
+
+
+# =============================================================================
+# Vector Similarity Utilities
+# =============================================================================
+
+def cosine_similarity(a: list[float], b: list[float]) -> float:
+    """Compute cosine similarity between two vectors.
+
+    Uses numpy for performance when available, falls back to pure Python.
+    """
+    try:
+        import numpy as np
+        a_arr = np.array(a)
+        b_arr = np.array(b)
+        dot = np.dot(a_arr, b_arr)
+        norm_a = np.linalg.norm(a_arr)
+        norm_b = np.linalg.norm(b_arr)
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+        return float(dot / (norm_a * norm_b))
+    except ImportError:
+        # Fallback for environments without numpy
+        dot = sum(x * y for x, y in zip(a, b))
+        norm_a = sum(x * x for x in a) ** 0.5
+        norm_b = sum(x * x for x in b) ** 0.5
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+        return dot / (norm_a * norm_b)
+
+
+# =============================================================================
+# SLO Metrics Support
+# =============================================================================
+
+@dataclass
+class PercentileHistogram:
+    """Histogram with percentile calculations for SLO monitoring.
+
+    Uses reservoir sampling to maintain bounded memory while
+    providing accurate percentile estimates.
+    """
+    values: list = field(default_factory=list)
+    max_samples: int = 10000
+
+    def observe(self, value: float) -> None:
+        if len(self.values) < self.max_samples:
+            self.values.append(value)
+        else:
+            # Reservoir sampling
+            idx = random.randint(0, len(self.values))
+            if idx < self.max_samples:
+                self.values[idx] = value
+
+    def percentile(self, p: float) -> float | None:
+        """Calculate percentile (0-100)."""
+        if not self.values:
+            return None
+        sorted_vals = sorted(self.values)
+        idx = int(len(sorted_vals) * p / 100)
+        return sorted_vals[min(idx, len(sorted_vals) - 1)]
+
+    def slo_summary(self) -> dict:
+        """Return p50, p95, p99 for SLO dashboards."""
+        return {
+            "p50_ms": round(self.percentile(50) * 1000, 2) if self.percentile(50) else None,
+            "p95_ms": round(self.percentile(95) * 1000, 2) if self.percentile(95) else None,
+            "p99_ms": round(self.percentile(99) * 1000, 2) if self.percentile(99) else None,
+            "count": len(self.values),
+        }
 
 
 # =============================================================================
@@ -152,6 +274,10 @@ class PlannerAgent(ResearchAgent):
     async def process(self, project: ResearchProject, context: dict) -> dict:
         """Create research plan."""
         self.tasks_completed += 1
+        logger.info(
+            "Creating research plan",
+            extra={"extra_fields": {"task_id": project.id, "agent_name": self.name, "query": project.query.query}}
+        )
 
         query = project.query
 
@@ -270,18 +396,42 @@ class GathererAgent(ResearchAgent):
         super().__init__("gatherer-agent", "Information Gatherer")
         self.simulated_sources = self._create_simulated_sources()
 
-    async def process(self, project: ResearchProject, context: dict) -> dict:
-        """Gather information for research."""
+    async def process(self, project: ResearchProject, context: dict,
+                       per_source_timeout: float = 30.0) -> dict:
+        """Gather information for research.
+
+        Args:
+            project: The research project to gather information for.
+            context: Additional context (unused).
+            per_source_timeout: Timeout per source in seconds (default: 30.0).
+        """
+        # Input validation
+        if per_source_timeout is not None and per_source_timeout <= 0:
+            raise ValueError("Timeout must be positive")
+
         self.tasks_completed += 1
+        logger.info(
+            "Gathering information from sources",
+            extra={"extra_fields": {"task_id": project.id, "agent_name": self.name, "strategies_count": len(project.plan.get("search_strategies", []))}}
+        )
 
         plan = project.plan
         strategies = plan.get("search_strategies", [])
 
-        # Simulate parallel gathering
-        gather_tasks = []
-        for strategy in strategies:
-            gather_tasks.append(self._gather_for_strategy(strategy))
+        # Parallel gathering with per-task timeout
+        async def gather_with_timeout(strategy: dict) -> Optional[Source]:
+            try:
+                return await asyncio.wait_for(
+                    self._gather_for_strategy(strategy),
+                    timeout=per_source_timeout
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"Timeout gathering source for strategy: {strategy.get('sub_question', 'unknown')}"
+                )
+                return None
 
+        gather_tasks = [gather_with_timeout(s) for s in strategies]
         results = await asyncio.gather(*gather_tasks)
 
         # Process results
@@ -364,6 +514,10 @@ class AnalyzerAgent(ResearchAgent):
     async def process(self, project: ResearchProject, context: dict) -> dict:
         """Analyze sources and extract facts."""
         self.tasks_completed += 1
+        logger.info(
+            "Analyzing sources and extracting facts",
+            extra={"extra_fields": {"task_id": project.id, "agent_name": self.name, "sources_count": len(project.sources)}}
+        )
 
         facts_extracted = []
 
@@ -387,8 +541,8 @@ class AnalyzerAgent(ResearchAgent):
             "facts_extracted": len(facts_extracted),
             "fact_ids": facts_extracted,
             "contradictions_found": len(contradictions),
-            "avg_confidence": sum(f.confidence for f in project.facts.values()) /
-                            len(project.facts) if project.facts else 0
+            "avg_confidence": (sum(f.confidence for f in project.facts.values()) /
+                            len(project.facts)) if project.facts else 0
         }
 
     async def _extract_facts(self, source: Source) -> list[Fact]:
@@ -448,6 +602,10 @@ class SynthesizerAgent(ResearchAgent):
     async def process(self, project: ResearchProject, context: dict) -> dict:
         """Synthesize research into report sections."""
         self.tasks_completed += 1
+        logger.info(
+            "Synthesizing research into report sections",
+            extra={"extra_fields": {"task_id": project.id, "agent_name": self.name, "facts_count": len(project.facts)}}
+        )
 
         outline = project.plan.get("outline", [])
         sections = []
@@ -526,6 +684,10 @@ class ValidatorAgent(ResearchAgent):
     async def process(self, project: ResearchProject, context: dict) -> dict:
         """Validate research quality."""
         self.tasks_completed += 1
+        logger.info(
+            "Validating research quality",
+            extra={"extra_fields": {"task_id": project.id, "agent_name": self.name, "sections_count": len(project.sections)}}
+        )
 
         validation_results = {}
 
@@ -601,6 +763,10 @@ class ReportGenerator(ResearchAgent):
     async def process(self, project: ResearchProject, context: dict) -> dict:
         """Generate final report."""
         self.tasks_completed += 1
+        logger.info(
+            "Generating final report",
+            extra={"extra_fields": {"task_id": project.id, "agent_name": self.name, "sources_count": len(project.sources)}}
+        )
 
         report_parts = []
 
@@ -641,9 +807,33 @@ class ReportGenerator(ResearchAgent):
 class ResearchOrchestrator:
     """
     Orchestrates the multi-agent research workflow.
+
+    Includes configurable timeouts for each phase to prevent indefinite hangs.
     """
 
-    def __init__(self):
+    # Default timeouts for each phase (in seconds)
+    DEFAULT_TIMEOUTS = {
+        "planning": 60.0,
+        "gathering": 120.0,
+        "analysis": 120.0,
+        "synthesis": 90.0,
+        "validation": 60.0,
+        "report": 60.0,
+    }
+
+    def __init__(self, timeouts: dict[str, float] | None = None):
+        """Initialize the research orchestrator.
+
+        Args:
+            timeouts: Optional dict of phase timeouts in seconds.
+                      Keys: planning, gathering, analysis, synthesis, validation, report.
+        """
+        # Input validation for timeouts
+        if timeouts is not None:
+            for phase, timeout in timeouts.items():
+                if timeout is not None and timeout <= 0:
+                    raise ValueError(f"Timeout for phase '{phase}' must be positive")
+
         self.planner = PlannerAgent()
         self.gatherer = GathererAgent()
         self.analyzer = AnalyzerAgent()
@@ -652,15 +842,53 @@ class ResearchOrchestrator:
         self.reporter = ReportGenerator()
 
         self.projects: dict[str, ResearchProject] = {}
+        self._max_projects = 1000
         self.metrics = defaultdict(int)
+        self.timeouts = {**self.DEFAULT_TIMEOUTS, **(timeouts or {})}
+
+        # Duration metrics collector for research phases
+        self.duration_metrics = MetricsCollector(namespace="research")
+
+        # Percentile histograms for SLO monitoring
+        self.phase_histograms: dict[str, PercentileHistogram] = {
+            phase: PercentileHistogram() for phase in self.DEFAULT_TIMEOUTS
+        }
 
     async def research(self, query: ResearchQuery) -> ResearchProject:
         """Execute complete research workflow."""
+        # Input validation for query
+        if not query.query or len(query.query.strip()) == 0:
+            raise ValueError("Query cannot be empty")
+        if len(query.query) > 10000:
+            raise ValueError("Query too long (max 10000 characters)")
+
+        # Input validation for required_sources
+        if query.required_sources <= 0:
+            raise ValueError("required_sources must be positive")
+        if query.required_sources > 100:
+            raise ValueError("required_sources too large (max 100)")
+
+        # Input validation for max_depth
+        if query.max_depth <= 0:
+            raise ValueError("max_depth must be positive")
+        if query.max_depth > 100:
+            raise ValueError("max_depth too large (max 100)")
+
         # Create project
         project = ResearchProject(
             id=f"proj_{int(time.time())}",
             query=query
         )
+        logger.info(
+            "Starting research project",
+            extra={"extra_fields": {"task_id": project.id, "query": query.query, "scope": query.scope}}
+        )
+        # Cleanup completed projects if at capacity
+        if len(self.projects) >= self._max_projects:
+            completed = [pid for pid, p in self.projects.items()
+                        if p.status in (ResearchStatus.COMPLETE, ResearchStatus.FAILED)]
+            for pid in completed[:100]:
+                del self.projects[pid]
         self.projects[project.id] = project
         self.metrics["projects_started"] += 1
 
@@ -668,44 +896,99 @@ class ResearchOrchestrator:
         print(f"  Query: {query.query}")
         print(f"  Scope: {query.scope}")
 
-        # Phase 1: Planning
-        print("\n[PHASE 1] Planning research strategy...")
-        plan_result = await self.planner.process(project, {})
-        print(f"  Sub-questions: {len(plan_result['sub_questions'])}")
-        print(f"  Search strategies: {len(plan_result['search_strategies'])}")
+        try:
+            # Phase 1: Planning (with timeout)
+            print("\n[PHASE 1] Planning research strategy...")
+            planning_start = time.time()
+            async with timed_block(self.duration_metrics, "phase_duration_seconds", {"phase": "planning"}):
+                plan_result = await asyncio.wait_for(
+                    self.planner.process(project, {}),
+                    timeout=self.timeouts["planning"]
+                )
+            self.phase_histograms["planning"].observe(time.time() - planning_start)
+            print(f"  Sub-questions: {len(plan_result['sub_questions'])}")
+            print(f"  Search strategies: {len(plan_result['search_strategies'])}")
 
-        # Phase 2: Gathering
-        print("\n[PHASE 2] Gathering information...")
-        gather_result = await self.gatherer.process(project, {})
-        print(f"  Sources gathered: {gather_result['sources_gathered']}")
-        print(f"  By type: {gather_result['by_type']}")
+            # Phase 2: Gathering (with timeout)
+            print("\n[PHASE 2] Gathering information...")
+            gathering_start = time.time()
+            async with timed_block(self.duration_metrics, "phase_duration_seconds", {"phase": "gathering"}):
+                gather_result = await asyncio.wait_for(
+                    self.gatherer.process(project, {}),
+                    timeout=self.timeouts["gathering"]
+                )
+            self.phase_histograms["gathering"].observe(time.time() - gathering_start)
+            print(f"  Sources gathered: {gather_result['sources_gathered']}")
+            print(f"  By type: {gather_result['by_type']}")
 
-        # Phase 3: Analysis
-        print("\n[PHASE 3] Analyzing content...")
-        analyze_result = await self.analyzer.process(project, {})
-        print(f"  Facts extracted: {analyze_result['facts_extracted']}")
-        print(f"  Average confidence: {analyze_result['avg_confidence']:.0%}")
+            # Phase 3: Analysis (with timeout)
+            print("\n[PHASE 3] Analyzing content...")
+            analysis_start = time.time()
+            async with timed_block(self.duration_metrics, "phase_duration_seconds", {"phase": "analysis"}):
+                analyze_result = await asyncio.wait_for(
+                    self.analyzer.process(project, {}),
+                    timeout=self.timeouts["analysis"]
+                )
+            self.phase_histograms["analysis"].observe(time.time() - analysis_start)
+            print(f"  Facts extracted: {analyze_result['facts_extracted']}")
+            print(f"  Average confidence: {analyze_result['avg_confidence']:.0%}")
 
-        # Phase 4: Synthesis
-        print("\n[PHASE 4] Synthesizing findings...")
-        synth_result = await self.synthesizer.process(project, {})
-        print(f"  Sections created: {synth_result['sections_created']}")
+            # Phase 4: Synthesis (with timeout)
+            print("\n[PHASE 4] Synthesizing findings...")
+            synthesis_start = time.time()
+            async with timed_block(self.duration_metrics, "phase_duration_seconds", {"phase": "synthesis"}):
+                synth_result = await asyncio.wait_for(
+                    self.synthesizer.process(project, {}),
+                    timeout=self.timeouts["synthesis"]
+                )
+            self.phase_histograms["synthesis"].observe(time.time() - synthesis_start)
+            print(f"  Sections created: {synth_result['sections_created']}")
 
-        # Phase 5: Validation
-        print("\n[PHASE 5] Validating quality...")
-        valid_result = await self.validator.process(project, {})
-        print(f"  Validation passed: {valid_result['overall_passed']}")
-        print(f"  Score: {valid_result['overall_score']:.0%}")
+            # Phase 5: Validation (with timeout)
+            print("\n[PHASE 5] Validating quality...")
+            validation_start = time.time()
+            async with timed_block(self.duration_metrics, "phase_duration_seconds", {"phase": "validation"}):
+                valid_result = await asyncio.wait_for(
+                    self.validator.process(project, {}),
+                    timeout=self.timeouts["validation"]
+                )
+            self.phase_histograms["validation"].observe(time.time() - validation_start)
+            print(f"  Validation passed: {valid_result['overall_passed']}")
+            print(f"  Score: {valid_result['overall_score']:.0%}")
 
-        # Phase 6: Report Generation
-        if valid_result['overall_passed']:
-            print("\n[PHASE 6] Generating report...")
-            report_result = await self.reporter.process(project, {})
-            print(f"  Report length: {report_result['report_length']} chars")
-            self.metrics["projects_completed"] += 1
-        else:
-            print("\n[PHASE 6] Skipped - validation failed")
+            # Phase 6: Report Generation (with timeout)
+            if valid_result['overall_passed']:
+                print("\n[PHASE 6] Generating report...")
+                report_start = time.time()
+                async with timed_block(self.duration_metrics, "phase_duration_seconds", {"phase": "report"}):
+                    report_result = await asyncio.wait_for(
+                        self.reporter.process(project, {}),
+                        timeout=self.timeouts["report"]
+                    )
+                self.phase_histograms["report"].observe(time.time() - report_start)
+                print(f"  Report length: {report_result['report_length']} chars")
+                self.metrics["projects_completed"] += 1
+                logger.info(
+                    "Research project completed successfully",
+                    extra={"extra_fields": {"task_id": project.id, "report_length": report_result['report_length']}}
+                )
+            else:
+                print("\n[PHASE 6] Skipped - validation failed")
+                self.metrics["projects_failed"] += 1
+                logger.warning(
+                    "Research project validation failed",
+                    extra={"extra_fields": {"task_id": project.id, "validation_score": valid_result['overall_score']}}
+                )
+
+        except asyncio.TimeoutError as e:
+            project.status = ResearchStatus.FAILED
             self.metrics["projects_failed"] += 1
+            self.metrics["timeout_errors"] += 1
+            logger.error(
+                "Research project timed out",
+                extra={"extra_fields": {"task_id": project.id, "error": str(e)}}
+            )
+            print(f"\n[ERROR] Project timed out: {e}")
 
         return project
 
@@ -719,7 +1002,15 @@ class ResearchOrchestrator:
                     self.planner, self.gatherer, self.analyzer,
                     self.synthesizer, self.validator, self.reporter
                 ]
-            }
+            },
+            "phase_durations": self.duration_metrics.export_json()
+        }
+
+    def get_slo_metrics(self) -> dict:
+        """Return SLO metrics (p50, p95, p99) for each research phase."""
+        return {
+            phase: hist.slo_summary()
+            for phase, hist in self.phase_histograms.items()
         }
 
 

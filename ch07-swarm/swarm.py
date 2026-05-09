@@ -14,8 +14,34 @@ Production Notes:
 - Consider rate limiting on pheromone deposits to prevent flooding
 """
 
+__all__ = [
+    "BackpressureInfo",
+    "QueueFullError",
+    "PheromoneType",
+    "Pheromone",
+    "PheromoneField",
+    "DecayStrategies",
+    "SwarmTask",
+    "TaskPool",
+    "AgentCapability",
+    "SwarmAgent",
+    "Swarm",
+    "HeterogeneousSwarm",
+    "HierarchicalSwarm",
+    "HandoffSwarm",
+    "SpecializationSwarm",
+    "PheromoneStrategies",
+    "evaporation_loop",
+    "ExplorationStrategy",
+    "AgentState",
+    "SwarmSnapshot",
+    "SwarmObserver",
+    "SwarmController",
+]
+
 import asyncio
 import math
+import os
 import random
 import time
 import uuid
@@ -23,10 +49,34 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable, Optional
-from collections import defaultdict
+from collections import defaultdict, deque
 import json
 import hashlib
 import logging
+
+# Maximum number of tasks allowed in the queue (configurable via environment variable)
+MAX_QUEUE_SIZE = int(os.environ.get("SWARM_MAX_QUEUE_SIZE", "10000"))
+
+
+@dataclass
+class BackpressureInfo:
+    """Backpressure signaling for upstream callers."""
+    queue_depth: int
+    max_queue_size: int
+    utilization: float  # 0.0 to 1.0
+    retry_after_seconds: float | None  # Suggested wait time, None if not overloaded
+
+    @property
+    def is_overloaded(self) -> bool:
+        return self.utilization > 0.9
+
+
+class QueueFullError(Exception):
+    """Raised when the task queue has reached its maximum capacity."""
+
+    def __init__(self, message: str, backpressure: BackpressureInfo = None):
+        super().__init__(message)
+        self.backpressure = backpressure
 
 # Import common utilities for structured logging
 import sys
@@ -253,6 +303,8 @@ class PheromoneField:
     """
 
     def __init__(self, max_pheromones: int = 10000):
+        if max_pheromones <= 0:
+            raise ValueError("Max pheromones must be greater than 0")
         self.pheromones: list[Pheromone] = []
         self.max_pheromones = max_pheromones
 
@@ -348,14 +400,44 @@ class TaskPool:
     Implements task stealing and load balancing.
     """
 
-    def __init__(self):
+    def __init__(self, max_completed: int = 10000):
+        if max_completed <= 0:
+            raise ValueError("Max completed tasks must be greater than 0")
         self.tasks: dict[str, SwarmTask] = {}
-        self.completed: list[SwarmTask] = []
+        self.completed: deque[SwarmTask] = deque(maxlen=max_completed)
         self._lock = asyncio.Lock()
 
+    def get_backpressure_info(self) -> BackpressureInfo:
+        """Get current backpressure information for the task queue.
+
+        Returns:
+            BackpressureInfo with queue metrics and retry hints.
+        """
+        depth = len(self.tasks)
+        utilization = depth / MAX_QUEUE_SIZE if MAX_QUEUE_SIZE > 0 else 0
+        # Suggest retry after 1-5 seconds based on load
+        retry_after = min(5.0, 1.0 + utilization * 4) if utilization > 0.8 else None
+        return BackpressureInfo(
+            queue_depth=depth,
+            max_queue_size=MAX_QUEUE_SIZE,
+            utilization=utilization,
+            retry_after_seconds=retry_after
+        )
+
     async def add_task(self, task: SwarmTask):
-        """Add a task to the pool."""
+        """Add a task to the pool.
+
+        Raises:
+            QueueFullError: If the queue has reached MAX_QUEUE_SIZE capacity.
+                           The error includes backpressure info with retry hints.
+        """
         async with self._lock:
+            if len(self.tasks) >= MAX_QUEUE_SIZE:
+                backpressure = self.get_backpressure_info()
+                raise QueueFullError(
+                    f"Queue at {backpressure.utilization:.0%} capacity",
+                    backpressure=backpressure
+                )
             self.tasks[task.id] = task
 
     async def claim_task(self, agent_id: str,
@@ -612,6 +694,8 @@ class Swarm:
     def __init__(self,
                  decay_rate: float = 0.05,
                  enable_queen: bool = True):
+        if not 0 <= decay_rate <= 1:
+            raise ValueError("Decay rate must be between 0 and 1")
         self.task_pool = TaskPool()
         self.pheromone_trail = PheromoneField()
         self.decay_rate = decay_rate
@@ -659,7 +743,7 @@ class Swarm:
             self._agent_tasks.append(queen_task)
 
     async def stop(self):
-        """Stop all agents in the swarm."""
+        """Stop all agents in the swarm and clean up pending operations."""
         self._running = False
         for agent in self.agents.values():
             await agent.stop()
@@ -668,6 +752,11 @@ class Swarm:
             task.cancel()
 
         await asyncio.gather(*self._agent_tasks, return_exceptions=True)
+
+        # Clean up any pending stops from subclass operations (e.g., rebalance)
+        if hasattr(self, '_pending_stops') and self._pending_stops:
+            await asyncio.gather(*self._pending_stops, return_exceptions=True)
+            self._pending_stops.clear()
 
     async def _queen_loop(self):
         """
@@ -767,6 +856,8 @@ class HeterogeneousSwarm(Swarm):
     def add_agent_type(self, type_name: str,
                         capability: AgentCapability, count: int):
         """Add a type of agent to the swarm."""
+        if count <= 0:
+            raise ValueError("Agent count must be greater than 0")
         self.agent_types[type_name] = capability
 
         for i in range(count):
@@ -802,6 +893,8 @@ class HeterogeneousSwarm(Swarm):
                     # Track task to avoid 'Task was destroyed' warnings
                     if not hasattr(self, '_pending_stops'):
                         self._pending_stops = []
+                    # Clean up completed stop tasks before adding new ones
+                    self._pending_stops = [t for t in self._pending_stops if not t.done()]
                     self._pending_stops.append(asyncio.create_task(agent.stop()))
 
 
@@ -934,11 +1027,10 @@ class SpecializationSwarm(Swarm):
     Implements emergent division of labor.
     """
 
-    def __init__(self, **kwargs):
+    def __init__(self, max_tracked_agents: int = 1000, **kwargs):
         super().__init__(**kwargs)
-        self.specialization_scores: dict[str, dict[str, float]] = defaultdict(
-            lambda: defaultdict(float)
-        )  # agent_id -> task_type -> score
+        self._max_tracked_agents = max_tracked_agents
+        self.specialization_scores: dict[str, dict[str, float]] = {}  # agent_id -> task_type -> score
 
     def add_agent(self, agent_id: str, capability: AgentCapability,
                   task_handler: Callable[[SwarmTask], Any]) -> SwarmAgent:
@@ -951,12 +1043,17 @@ class SpecializationSwarm(Swarm):
         async def tracking_handler(task: SwarmTask):
             try:
                 result = await self._run_handler(original_handler, task)
-                # Increase specialization on success
-                self.specialization_scores[agent_id][task.type] += 0.1
+                # Increase specialization on success (with bounds check)
+                if len(self.specialization_scores) < self._max_tracked_agents or agent_id in self.specialization_scores:
+                    if agent_id not in self.specialization_scores:
+                        self.specialization_scores[agent_id] = {}
+                    self.specialization_scores[agent_id][task.type] = self.specialization_scores[agent_id].get(task.type, 0.0) + 0.1
                 return result
             except Exception as e:
                 # Decrease specialization on failure
-                self.specialization_scores[agent_id][task.type] -= 0.05
+                if agent_id not in self.specialization_scores:
+                    self.specialization_scores[agent_id] = {}
+                self.specialization_scores[agent_id][task.type] = self.specialization_scores[agent_id].get(task.type, 0.0) - 0.05
                 raise e
 
         agent.task_handler = tracking_handler
@@ -1039,16 +1136,53 @@ class PheromoneStrategies:
                 ))
 
 
-async def evaporation_loop(swarm: Swarm, rate: float = 0.1):
-    """Background task that decays all pheromones."""
+async def evaporation_loop(
+    swarm: Swarm,
+    rate: float = 0.1,
+    shutdown_event: asyncio.Event = None
+):
+    """Background task that decays all pheromones.
+
+    Args:
+        swarm: The swarm whose pheromones to decay
+        rate: Decay rate per cycle (0.0-1.0)
+        shutdown_event: Optional event to signal graceful shutdown.
+                       When set, the loop will exit cleanly after
+                       completing the current decay cycle.
+
+    The loop respects both swarm._running and shutdown_event for
+    maximum flexibility in shutdown scenarios.
+    """
+    if not 0 <= rate <= 1:
+        raise ValueError("Decay rate must be between 0 and 1")
     while swarm._running:
+        # Check shutdown event if provided
+        if shutdown_event is not None and shutdown_event.is_set():
+            logger.info("Evaporation loop received shutdown signal")
+            break
+
         for pheromone in swarm.pheromone_trail.all():
             pheromone.intensity *= (1 - rate)
 
         # Remove faded pheromones
         swarm.pheromone_trail.prune(threshold=0.01)
 
-        await asyncio.sleep(10)  # Every 10 seconds
+        # Use wait_for with timeout to allow checking shutdown periodically
+        try:
+            if shutdown_event is not None:
+                # Wait for shutdown or timeout
+                await asyncio.wait_for(
+                    shutdown_event.wait(),
+                    timeout=10.0
+                )
+                # If we get here, shutdown was signaled
+                logger.info("Evaporation loop shutdown complete")
+                break
+            else:
+                await asyncio.sleep(10)  # Every 10 seconds
+        except asyncio.TimeoutError:
+            # Normal timeout, continue the loop
+            continue
 
 
 # =============================================================================
@@ -1064,6 +1198,12 @@ class ExplorationStrategy:
         success_adjustment: float = 0.02,
         failure_adjustment: float = 0.05
     ):
+        if not 0 <= base_exploration_rate <= 1:
+            raise ValueError("Base exploration rate must be between 0 and 1")
+        if success_adjustment < 0:
+            raise ValueError("Success adjustment must be non-negative")
+        if failure_adjustment < 0:
+            raise ValueError("Failure adjustment must be non-negative")
         self.base_rate = base_exploration_rate
         self.success_adjustment = success_adjustment
         self.failure_adjustment = failure_adjustment

@@ -14,6 +14,51 @@ This module provides a complete hybrid architecture system that:
 Demonstrates pattern composition and dynamic routing.
 """
 
+__all__ = [
+    "retry_with_backoff",
+    "ValidationResult",
+    "PatternType",
+    "PhaseType",
+    "TaskCharacteristics",
+    "PatternScore",
+    "RoutingDecision",
+    "ExecutionResult",
+    "HybridPhase",
+    "OrchestratorResult",
+    "Decision",
+    "GuardedOrchestrator",
+    "SwarmCouncilPipeline",
+    "OrchestratorSwarmHybrid",
+    "Constraint",
+    "ConstrainedDecision",
+    "CouncilDecision",
+    "CouncilMessage",
+    "Councilor",
+    "ConstrainedCouncil",
+    "PatternRouter",
+    "RoutedResult",
+    "PipelinePhase",
+    "AdaptivePipeline",
+    "PhaseResult",
+    "PipelineResult",
+    "TaskAnalyzer",
+    "PatternScorer",
+    "HybridRouter",
+    "Phase",
+    "ProductionPhaseResult",
+    "ProductionPipelineResult",
+    "ProductionAdaptivePipeline",
+    "ValidationResponse",
+    "ApprovalResponse",
+    "QuestionCheckResponse",
+    "DecisionValidationResponse",
+    "SwarmResult",
+    "MockOrchestrator",
+    "MockGuardian",
+    "MockSwarmCoordinator",
+    "MockCouncil",
+]
+
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol, TypeVar
 from enum import Enum
@@ -21,9 +66,111 @@ from abc import ABC, abstractmethod
 import asyncio
 import json
 import logging
+import time
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
+
+# =============================================================================
+# Circuit Breaker Import with Fallback
+# =============================================================================
+
+try:
+    from common.resilience import CircuitBreaker, CircuitBreakerOpen
+except ImportError:
+    # Inline fallback implementation for standalone operation
+    class CircuitBreakerOpen(Exception):
+        """Exception raised when circuit breaker is open."""
+        def __init__(self, breaker_name: str, time_until_retry: float = 0.0):
+            self.breaker_name = breaker_name
+            self.time_until_retry = time_until_retry
+            super().__init__(
+                f"Circuit breaker '{breaker_name}' is OPEN. "
+                f"Retry in {time_until_retry:.1f}s"
+            )
+
+    @dataclass
+    class CircuitBreaker:
+        """Fallback circuit breaker for standalone operation."""
+        name: str
+        failure_threshold: int = 5
+        recovery_timeout: float = 30.0
+
+        _failure_count: int = field(default=0, init=False)
+        _last_failure_time: float = field(default=0.0, init=False)
+        _is_open: bool = field(default=False, init=False)
+
+        def _check_recovery(self) -> None:
+            """Check if circuit should recover from open state."""
+            if self._is_open and self._last_failure_time > 0:
+                if time.time() - self._last_failure_time >= self.recovery_timeout:
+                    self._is_open = False
+                    self._failure_count = 0
+
+        def allow(self) -> bool:
+            """Check if requests are allowed through the circuit."""
+            self._check_recovery()
+            return not self._is_open
+
+        def record_success(self) -> None:
+            """Record a successful call."""
+            self._failure_count = 0
+            self._is_open = False
+
+        def record_failure(self) -> None:
+            """Record a failed call."""
+            self._failure_count += 1
+            self._last_failure_time = time.time()
+            if self._failure_count >= self.failure_threshold:
+                self._is_open = True
+
+
+# =============================================================================
+# Retry Utilities
+# =============================================================================
+
+async def retry_with_backoff(
+    func: Callable,
+    *args,
+    max_retries: int = 3,
+    base_delay: float = 1.0,
+    max_delay: float = 30.0,
+    exceptions: tuple = (Exception,),
+    **kwargs
+) -> Any:
+    """Execute an async function with exponential backoff retry.
+
+    Args:
+        func: The async function to execute.
+        *args: Positional arguments to pass to the function.
+        max_retries: Maximum number of retry attempts (default: 3).
+        base_delay: Base delay in seconds for exponential backoff (default: 1.0).
+        max_delay: Maximum delay between retries in seconds (default: 30.0).
+        exceptions: Tuple of exception types to catch and retry on.
+        **kwargs: Keyword arguments to pass to the function.
+
+    Returns:
+        The result of the function call.
+
+    Raises:
+        The last exception if all retries fail.
+    """
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            return await func(*args, **kwargs)
+        except exceptions as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                delay = min(base_delay * (2 ** attempt), max_delay)
+                logger.warning(
+                    f"Attempt {attempt + 1}/{max_retries} failed: {e}. "
+                    f"Retrying in {delay:.1f}s..."
+                )
+                await asyncio.sleep(delay)
+            else:
+                logger.error(f"All {max_retries} attempts failed: {e}")
+    raise last_error
 
 
 # =============================================================================
@@ -543,8 +690,8 @@ Return a JSON array of phases:
 
         try:
             phase_data = json.loads(response.content)
-        except json.JSONDecodeError:
-            # Fallback to single-phase execution if LLM response isn't valid JSON
+        except (json.JSONDecodeError, KeyError, TypeError):
+            # Fallback to single-phase execution if LLM response isn't valid or missing keys
             return [HybridPhase(
                 id="fallback",
                 description=task,
@@ -1088,6 +1235,28 @@ class AdaptivePipeline:
     ):
         self.router = router
         self.patterns = default_patterns
+        # Circuit breakers per stage type for failure isolation
+        self._stage_circuit_breakers: dict[str, CircuitBreaker] = {}
+
+    def _get_stage_cb(self, stage_name: str) -> CircuitBreaker:
+        """Get or create a circuit breaker for a pipeline stage.
+
+        Each stage gets its own circuit breaker to isolate failures,
+        preventing one failing stage from affecting others.
+
+        Args:
+            stage_name: Unique identifier for the stage.
+
+        Returns:
+            CircuitBreaker instance for this stage.
+        """
+        if stage_name not in self._stage_circuit_breakers:
+            self._stage_circuit_breakers[stage_name] = CircuitBreaker(
+                name=f"pipeline_stage_{stage_name}",
+                failure_threshold=3,
+                recovery_timeout=30.0
+            )
+        return self._stage_circuit_breakers[stage_name]
 
     async def execute(
         self,
@@ -1223,7 +1392,20 @@ Return JSON:
         pattern_type: PatternType,
         context: dict
     ) -> Any:
-        """Execute a single phase with the selected pattern."""
+        """Execute a single phase with the selected pattern.
+
+        Uses circuit breaker to isolate failures per stage, preventing
+        cascading failures across the pipeline.
+        """
+        # Get circuit breaker for this stage
+        cb = self._get_stage_cb(phase.id)
+
+        # Check if circuit breaker allows execution
+        if not cb.allow():
+            raise CircuitBreakerOpen(
+                f"pipeline_stage_{phase.id}",
+                cb.recovery_timeout
+            )
 
         task_description = f"""
 {phase.description}
@@ -1232,28 +1414,38 @@ Context from previous phases:
 {json.dumps(context.get('dependencies', {}), indent=2)}
 """
 
-        if pattern_type in [
-            PatternType.ORCHESTRATOR,
-            PatternType.ORCHESTRATOR_GUARDIAN,
-            PatternType.ORCHESTRATOR_SWARM
-        ]:
-            return await pattern.execute(task_description)
+        try:
+            if pattern_type in [
+                PatternType.ORCHESTRATOR,
+                PatternType.ORCHESTRATOR_GUARDIAN,
+                PatternType.ORCHESTRATOR_SWARM
+            ]:
+                result = await pattern.execute(task_description)
 
-        elif pattern_type in [
-            PatternType.COUNCIL,
-            PatternType.COUNCIL_GUARDIAN
-        ]:
-            return await pattern.deliberate(task_description, context)
+            elif pattern_type in [
+                PatternType.COUNCIL,
+                PatternType.COUNCIL_GUARDIAN
+            ]:
+                result = await pattern.deliberate(task_description, context)
 
-        elif pattern_type == PatternType.SWARM:
-            return await pattern.run(task_description)
+            elif pattern_type == PatternType.SWARM:
+                result = await pattern.run(task_description)
 
-        elif pattern_type == PatternType.COUNCIL_SWARM:
-            return await pattern.decide(task_description, context)
+            elif pattern_type == PatternType.COUNCIL_SWARM:
+                result = await pattern.decide(task_description, context)
 
-        else:
-            # Generic execution
-            return await pattern.execute(task_description)
+            else:
+                # Generic execution
+                result = await pattern.execute(task_description)
+
+            # Record success with circuit breaker
+            cb.record_success()
+            return result
+
+        except Exception as e:
+            # Record failure with circuit breaker
+            cb.record_failure()
+            raise
 
     async def aggregate_results(
         self,
@@ -1317,9 +1509,11 @@ class PipelineResult:
 class TaskAnalyzer:
     """Analyzes tasks to determine characteristics."""
 
-    def __init__(self, llm_client):
+    def __init__(self, llm_client, max_cache_size: int = 1000):
         self.llm = llm_client
         self._cache: dict[str, TaskCharacteristics] = {}
+        self._max_cache_size = max_cache_size
+        self._cache_order: list[str] = []  # Track insertion order for LRU eviction
 
     async def analyze(
         self,
@@ -1351,7 +1545,12 @@ class TaskAnalyzer:
             logger.error(f"Task analysis failed: {e}")
             characteristics = TaskCharacteristics()
 
+        # LRU eviction if at capacity
+        if len(self._cache) >= self._max_cache_size:
+            oldest_key = self._cache_order.pop(0)
+            self._cache.pop(oldest_key, None)
         self._cache[cache_key] = characteristics
+        self._cache_order.append(cache_key)
         return characteristics
 
     def _system_prompt(self) -> str:
@@ -1625,34 +1824,60 @@ class HybridRouter:
         pattern: Any,
         pattern_type: PatternType,
         task: str,
-        context: dict | None
+        context: dict | None,
+        max_retries: int = 3,
+        base_delay: float = 1.0
     ) -> Any:
-        """Execute the appropriate method based on pattern type."""
+        """Execute the appropriate method based on pattern type with retry logic.
 
-        # Deliberative patterns (Council variants)
-        if pattern_type in [
-            PatternType.COUNCIL,
-            PatternType.COUNCIL_GUARDIAN
-        ]:
-            if hasattr(pattern, 'deliberate'):
-                return await pattern.deliberate(task, context)
+        Args:
+            pattern: The pattern instance to execute.
+            pattern_type: The type of pattern being executed.
+            task: The task description.
+            context: Optional context dictionary.
+            max_retries: Maximum retry attempts on failure (default: 3).
+            base_delay: Base delay for exponential backoff (default: 1.0s).
 
-        # Exploratory patterns (Swarm)
-        if pattern_type == PatternType.SWARM:
-            if hasattr(pattern, 'run'):
-                return await pattern.run(task)
+        Returns:
+            The result of pattern execution.
 
-        # Hybrid exploration + deliberation
-        if pattern_type == PatternType.COUNCIL_SWARM:
-            if hasattr(pattern, 'decide'):
-                return await pattern.decide(task, context)
+        Raises:
+            ValueError: If pattern has no suitable execution method.
+        """
+        # Determine the execution function based on pattern type
+        async def execute_func():
+            # Deliberative patterns (Council variants)
+            if pattern_type in [
+                PatternType.COUNCIL,
+                PatternType.COUNCIL_GUARDIAN
+            ]:
+                if hasattr(pattern, 'deliberate'):
+                    return await pattern.deliberate(task, context)
 
-        # Default: execute method
-        if hasattr(pattern, 'execute'):
-            return await pattern.execute(task)
+            # Exploratory patterns (Swarm)
+            if pattern_type == PatternType.SWARM:
+                if hasattr(pattern, 'run'):
+                    return await pattern.run(task)
 
-        raise ValueError(
-            f"Pattern {pattern_type} has no suitable execution method"
+            # Hybrid exploration + deliberation
+            if pattern_type == PatternType.COUNCIL_SWARM:
+                if hasattr(pattern, 'decide'):
+                    return await pattern.decide(task, context)
+
+            # Default: execute method
+            if hasattr(pattern, 'execute'):
+                return await pattern.execute(task)
+
+            raise ValueError(
+                f"Pattern {pattern_type} has no suitable execution method"
+            )
+
+        # Execute with retry logic
+        return await retry_with_backoff(
+            execute_func,
+            max_retries=max_retries,
+            base_delay=base_delay,
+            exceptions=(RuntimeError, asyncio.TimeoutError, ConnectionError)
         )
 
 
@@ -1695,6 +1920,9 @@ class ProductionAdaptivePipeline:
     """
     Multi-phase pipeline with per-phase pattern selection.
 
+    Features circuit breakers per phase to isolate failures and prevent
+    cascading failures across the pipeline.
+
     Usage:
         pipeline = ProductionAdaptivePipeline(router)
         result = await pipeline.execute(
@@ -1709,6 +1937,28 @@ class ProductionAdaptivePipeline:
 
     def __init__(self, router: HybridRouter):
         self.router = router
+        # Circuit breakers per stage type for failure isolation
+        self._stage_circuit_breakers: dict[str, CircuitBreaker] = {}
+
+    def _get_stage_cb(self, stage_name: str) -> CircuitBreaker:
+        """Get or create a circuit breaker for a pipeline stage.
+
+        Each stage gets its own circuit breaker to isolate failures,
+        preventing one failing stage from affecting others.
+
+        Args:
+            stage_name: Unique identifier for the stage.
+
+        Returns:
+            CircuitBreaker instance for this stage.
+        """
+        if stage_name not in self._stage_circuit_breakers:
+            self._stage_circuit_breakers[stage_name] = CircuitBreaker(
+                name=f"pipeline_stage_{stage_name}",
+                failure_threshold=3,
+                recovery_timeout=30.0
+            )
+        return self._stage_circuit_breakers[stage_name]
 
     async def execute(
         self,
@@ -1772,9 +2022,27 @@ class ProductionAdaptivePipeline:
         phase: Phase,
         context: dict
     ) -> ProductionPhaseResult:
-        """Execute a single phase."""
+        """Execute a single phase with circuit breaker protection.
 
+        Uses circuit breaker to isolate failures per stage, preventing
+        cascading failures across the pipeline.
+        """
         start_time = datetime.now()
+
+        # Get circuit breaker for this stage
+        cb = self._get_stage_cb(phase.id)
+
+        # Check if circuit breaker allows execution
+        if not cb.allow():
+            return ProductionPhaseResult(
+                phase_id=phase.id,
+                pattern_used=PatternType.ORCHESTRATOR,
+                output=None,
+                execution_time_ms=0,
+                success=False,
+                error=f"Circuit breaker open for stage {phase.id}. "
+                      f"Retry after {cb.recovery_timeout:.1f}s"
+            )
 
         try:
             # Build task description for this phase
@@ -1794,6 +2062,12 @@ class ProductionAdaptivePipeline:
                 (datetime.now() - start_time).total_seconds() * 1000
             )
 
+            # Record success or failure with circuit breaker
+            if result.success:
+                cb.record_success()
+            else:
+                cb.record_failure()
+
             return ProductionPhaseResult(
                 phase_id=phase.id,
                 pattern_used=result.pattern_used or PatternType.ORCHESTRATOR,
@@ -1804,6 +2078,7 @@ class ProductionAdaptivePipeline:
             )
 
         except asyncio.TimeoutError:
+            cb.record_failure()
             return ProductionPhaseResult(
                 phase_id=phase.id,
                 pattern_used=PatternType.ORCHESTRATOR,
@@ -1813,6 +2088,7 @@ class ProductionAdaptivePipeline:
                 error=f"Phase timed out after {phase.timeout_seconds}s"
             )
         except Exception as e:
+            cb.record_failure()
             execution_time = int(
                 (datetime.now() - start_time).total_seconds() * 1000
             )
@@ -1963,45 +2239,174 @@ Create a cohesive final output addressing the original task.
 
 
 # =============================================================================
-# Stub Classes for Type Hints
+# Protocol Definitions for Pattern Integration
 # =============================================================================
-# IMPORTANT: These are PLACEHOLDER stubs for type hints and testing only.
-# In production, import the real implementations:
-#
-#   from ch05_orchestrator.orchestrator import SimpleOrchestrator, MultiAgentOrchestrator
-#   from ch06_council.council import Council
-#   from ch07_swarm.swarm import SwarmCoordinator
-#   from ch08_guardian.guardian import GuardianPipeline
-#
-# These stubs allow this module to run standalone for demonstration purposes.
+# These protocols define the expected interface for each pattern component.
+# Use these to ensure your implementations are compatible with the hybrid
+# architecture, and for type checking with mypy/pyright.
 # =============================================================================
 
-class Orchestrator:
-    """Stub for Orchestrator pattern.
 
-    PLACEHOLDER: In production, import from ch05-orchestrator/orchestrator.py:
-        from ch05_orchestrator.orchestrator import SimpleOrchestrator as Orchestrator
+class OrchestratorProtocol(Protocol):
+    """Protocol defining the Orchestrator interface.
+
+    Implement this protocol when creating custom orchestrators for use
+    with GuardedOrchestrator or OrchestratorSwarmHybrid.
+
+    Example implementation:
+        class MyOrchestrator:
+            def __init__(self, llm, workers: dict[str, WorkerProtocol]):
+                self.llm = llm
+                self.workers = workers
+
+            async def plan(self, task: str) -> dict[str, Subtask]:
+                # Use LLM to decompose task into subtasks
+                ...
+
+            def create_execution_plan(self, subtasks: dict) -> list[list[str]]:
+                # Return phases of subtask IDs that can run in parallel
+                ...
+
+            async def execute_subtask(self, subtask: Subtask, context: dict) -> Any:
+                worker = self.workers[subtask.worker_type]
+                return await worker.execute(subtask, context)
+
+            async def aggregate(self, results: dict, task: str) -> Any:
+                # Combine subtask results into final output
+                ...
     """
-    def __init__(self, llm=None, workers=None):
-        self.llm = llm
-        self.workers = workers or {}
+
+    llm: Any
+    workers: dict[str, Any]
 
     async def plan(self, task: str) -> dict:
-        """Plan task execution. # Placeholder: Returns empty dict."""
-        return {}
+        """Decompose task into subtasks."""
+        ...
 
     def create_execution_plan(self, subtasks: dict) -> list:
-        """Create execution plan. # Placeholder: Returns empty list."""
-        return []
+        """Create ordered phases of subtask execution."""
+        ...
 
     async def execute_subtask(self, subtask: Any, context: dict) -> Any:
-        """Execute a subtask. # Placeholder: Returns empty dict."""
-        return {}
+        """Execute a single subtask."""
+        ...
 
     async def aggregate(self, results: dict, task: str) -> Any:
-        """Aggregate results. # Placeholder: Returns results unchanged."""
-        return results
+        """Aggregate subtask results into final output."""
+        ...
 
+
+class GuardianProtocol(Protocol):
+    """Protocol defining the Guardian interface.
+
+    Implement this protocol for custom guardians in GuardedOrchestrator
+    or ConstrainedCouncil.
+
+    Example implementation:
+        class MyGuardian:
+            def __init__(self, policies: list[Policy]):
+                self.policies = policies
+
+            async def validate_input(self, task: str) -> ValidationResponse:
+                for policy in self.policies:
+                    if not policy.allows_input(task):
+                        return ValidationResponse(
+                            result=ValidationResult.REJECTED,
+                            reason=f"Policy {policy.name} rejected input"
+                        )
+                return ValidationResponse(result=ValidationResult.APPROVED)
+    """
+
+    async def validate_input(self, task: str) -> "ValidationResponse":
+        """Validate task input before processing."""
+        ...
+
+    async def validate_plan(self, subtasks: dict) -> "ValidationResponse":
+        """Validate execution plan before running."""
+        ...
+
+    async def validate_results(self, results: dict) -> "ValidationResponse":
+        """Validate results before returning."""
+        ...
+
+    async def approve_action(self, name: str, arguments: dict) -> "ApprovalResponse":
+        """Approve or reject a specific action."""
+        ...
+
+    async def validate_action_result(self, name: str, result: Any) -> "ValidationResponse":
+        """Validate the result of an action."""
+        ...
+
+    async def check_question(self, question: str, constraints: list) -> "QuestionCheckResponse":
+        """Check if a question is permissible given constraints."""
+        ...
+
+    async def validate_decision(self, decision: Any, constraints: list) -> "DecisionValidationResponse":
+        """Validate a decision against constraints."""
+        ...
+
+
+class SwarmCoordinatorProtocol(Protocol):
+    """Protocol defining the SwarmCoordinator interface.
+
+    Implement this protocol for custom swarm implementations in
+    SwarmCouncilPipeline or OrchestratorSwarmHybrid.
+
+    Example implementation:
+        class MySwarmCoordinator:
+            def __init__(self, agents: list[SwarmAgent], shared_memory: SharedMemory):
+                self.agents = agents
+                self.memory = shared_memory
+
+            async def run(self, goal: str, max_steps: int = 100) -> SwarmResult:
+                for step in range(max_steps):
+                    for agent in self.agents:
+                        result = await agent.act(goal, self.memory)
+                        self.memory.store(result)
+                return SwarmResult(
+                    artifacts=self.memory.get_artifacts(),
+                    exploration_map=self.memory.get_map()
+                )
+    """
+
+    async def run(self, goal: str, max_steps: int = 100) -> Any:
+        """Run swarm exploration toward a goal."""
+        ...
+
+
+class CouncilProtocol(Protocol):
+    """Protocol defining the Council interface.
+
+    Implement this protocol for custom council implementations in
+    SwarmCouncilPipeline or ConstrainedCouncil.
+
+    Example implementation:
+        class MyCouncil:
+            def __init__(self, councilors: list[Councilor], llm):
+                self.councilors = councilors
+                self.llm = llm
+
+            async def deliberate(self, question: str, context: dict = None) -> CouncilDecision:
+                transcript = []
+                for round in range(3):
+                    for councilor in self.councilors:
+                        response = await councilor.respond(question, transcript, context)
+                        transcript.append(response)
+                decision = await self.synthesize(transcript)
+                return CouncilDecision(question=question, decision=decision, transcript=transcript)
+    """
+
+    councilors: list
+    llm: Any
+
+    async def deliberate(self, question: str, context: dict = None) -> Any:
+        """Conduct deliberation on a question."""
+        ...
+
+
+# =============================================================================
+# Response Data Classes
+# =============================================================================
 
 @dataclass
 class ValidationResponse:
@@ -2035,87 +2440,355 @@ class DecisionValidationResponse:
     violations: list[str] = field(default_factory=list)
 
 
-class Guardian:
-    """Stub for Guardian pattern (from Chapter 8).
+@dataclass
+class SwarmResult:
+    """Result from swarm exploration."""
+    artifacts: list["Artifact"] = field(default_factory=list)
+    exploration_map: dict = field(default_factory=dict)
 
-    In production, import from ch08-guardian/guardian.py
+
+# =============================================================================
+# Mock Implementations for Testing
+# =============================================================================
+# These mock implementations can be used in unit tests to verify hybrid
+# architecture behavior without real LLM calls or complex dependencies.
+# =============================================================================
+
+
+class MockOrchestrator:
+    """Mock Orchestrator for testing hybrid architectures.
+
+    Usage in tests:
+        orchestrator = MockOrchestrator()
+        orchestrator.set_plan_result({
+            "subtask_1": Subtask(id="subtask_1", worker_type="research"),
+            "subtask_2": Subtask(id="subtask_2", worker_type="analysis")
+        })
+
+        guarded = GuardedOrchestrator(orchestrator=orchestrator, guardian=mock_guardian)
+        result = await guarded.execute("Test task")
     """
+
+    def __init__(self, llm=None, workers=None):
+        self.llm = llm
+        self.workers = workers or {}
+        self._plan_result: dict = {}
+        self._execution_plan: list = []
+        self._subtask_results: dict = {}
+        self._aggregate_result: Any = None
+        self.call_log: list[dict] = []
+
+    def set_plan_result(self, result: dict):
+        """Set the result that plan() will return."""
+        self._plan_result = result
+
+    def set_execution_plan(self, plan: list):
+        """Set the result that create_execution_plan() will return."""
+        self._execution_plan = plan
+
+    def set_subtask_result(self, subtask_id: str, result: Any):
+        """Set the result for a specific subtask."""
+        self._subtask_results[subtask_id] = result
+
+    def set_aggregate_result(self, result: Any):
+        """Set the result that aggregate() will return."""
+        self._aggregate_result = result
+
+    async def plan(self, task: str) -> dict:
+        """Return configured plan result."""
+        self.call_log.append({"method": "plan", "task": task})
+        return self._plan_result
+
+    def create_execution_plan(self, subtasks: dict) -> list:
+        """Return configured execution plan."""
+        self.call_log.append({"method": "create_execution_plan", "subtasks": subtasks})
+        return self._execution_plan or [list(subtasks.keys())]
+
+    async def execute_subtask(self, subtask: Any, context: dict) -> Any:
+        """Return configured subtask result."""
+        subtask_id = getattr(subtask, 'id', str(subtask))
+        self.call_log.append({
+            "method": "execute_subtask",
+            "subtask_id": subtask_id,
+            "context": context
+        })
+        return self._subtask_results.get(subtask_id, {"status": "success", "mock": True})
+
+    async def aggregate(self, results: dict, task: str) -> Any:
+        """Return configured aggregate result."""
+        self.call_log.append({"method": "aggregate", "results": results, "task": task})
+        return self._aggregate_result if self._aggregate_result is not None else results
+
+
+class MockGuardian:
+    """Mock Guardian for testing hybrid architectures.
+
+    Usage in tests:
+        guardian = MockGuardian()
+        guardian.set_input_validation(ValidationResponse(
+            result=ValidationResult.REJECTED,
+            reason="Test rejection"
+        ))
+
+        guarded = GuardedOrchestrator(orchestrator=mock_orch, guardian=guardian)
+        result = await guarded.execute("Dangerous task")
+        assert result.success == False
+    """
+
+    def __init__(self):
+        self._input_validation = ValidationResponse(result=ValidationResult.APPROVED)
+        self._plan_validation = ValidationResponse(result=ValidationResult.APPROVED)
+        self._results_validation = ValidationResponse(result=ValidationResult.APPROVED)
+        self._action_approval = ApprovalResponse(approved=True)
+        self._action_result_validation = ValidationResponse(result=ValidationResult.APPROVED)
+        self._question_check = QuestionCheckResponse(allowed=True)
+        self._decision_validation = DecisionValidationResponse(compliant=True)
+        self.call_log: list[dict] = []
+
+    def set_input_validation(self, response: ValidationResponse):
+        """Set response for validate_input()."""
+        self._input_validation = response
+
+    def set_plan_validation(self, response: ValidationResponse):
+        """Set response for validate_plan()."""
+        self._plan_validation = response
+
+    def set_results_validation(self, response: ValidationResponse):
+        """Set response for validate_results()."""
+        self._results_validation = response
+
+    def set_action_approval(self, response: ApprovalResponse):
+        """Set response for approve_action()."""
+        self._action_approval = response
+
+    def set_question_check(self, response: QuestionCheckResponse):
+        """Set response for check_question()."""
+        self._question_check = response
+
+    def set_decision_validation(self, response: DecisionValidationResponse):
+        """Set response for validate_decision()."""
+        self._decision_validation = response
+
     async def validate_input(self, task: str) -> ValidationResponse:
-        """Validate input. Placeholder: Always approves."""
+        self.call_log.append({"method": "validate_input", "task": task})
+        return self._input_validation
+
+    async def validate_plan(self, subtasks: dict) -> ValidationResponse:
+        self.call_log.append({"method": "validate_plan", "subtasks": subtasks})
+        return self._plan_validation
+
+    async def validate_results(self, results: dict) -> ValidationResponse:
+        self.call_log.append({"method": "validate_results", "results": results})
+        return self._results_validation
+
+    async def approve_action(self, name: str, arguments: dict) -> ApprovalResponse:
+        self.call_log.append({"method": "approve_action", "name": name, "arguments": arguments})
+        return self._action_approval
+
+    async def validate_action_result(self, name: str, result: Any) -> ValidationResponse:
+        self.call_log.append({"method": "validate_action_result", "name": name, "result": result})
+        return self._action_result_validation
+
+    async def check_question(self, question: str, constraints: list) -> QuestionCheckResponse:
+        self.call_log.append({"method": "check_question", "question": question})
+        return self._question_check
+
+    async def validate_decision(self, decision: Any, constraints: list) -> DecisionValidationResponse:
+        self.call_log.append({"method": "validate_decision", "decision": decision})
+        return self._decision_validation
+
+
+class MockSwarmCoordinator:
+    """Mock SwarmCoordinator for testing hybrid architectures.
+
+    Usage in tests:
+        swarm = MockSwarmCoordinator()
+        swarm.set_result(SwarmResult(
+            artifacts=[Artifact(content="Found option A"), Artifact(content="Found option B")],
+            exploration_map={"nodes": 5, "edges": 4}
+        ))
+
+        pipeline = SwarmCouncilPipeline(swarm=swarm, council=mock_council)
+        decision = await pipeline.decide("What approach should we take?")
+    """
+
+    def __init__(self):
+        self._result = SwarmResult()
+        self.call_log: list[dict] = []
+
+    def set_result(self, result: SwarmResult):
+        """Set the result that run() will return."""
+        self._result = result
+
+    async def run(self, goal: str, max_steps: int = 100) -> SwarmResult:
+        self.call_log.append({"method": "run", "goal": goal, "max_steps": max_steps})
+        return self._result
+
+
+class MockCouncil:
+    """Mock Council for testing hybrid architectures.
+
+    Usage in tests:
+        council = MockCouncil()
+        council.set_decision(CouncilDecision(
+            question="Test question",
+            decision="Option A is best because...",
+            transcript=[...]
+        ))
+
+        pipeline = SwarmCouncilPipeline(swarm=mock_swarm, council=council)
+        result = await pipeline.decide("Which option?")
+    """
+
+    def __init__(self, councilors=None, llm=None):
+        self.councilors = councilors or []
+        self.llm = llm
+        self._decision = CouncilDecision(question="", decision=None, transcript=[])
+        self.call_log: list[dict] = []
+
+    def set_decision(self, decision: CouncilDecision):
+        """Set the decision that deliberate() will return."""
+        self._decision = decision
+
+    async def deliberate(self, question: str, context: dict = None) -> CouncilDecision:
+        self.call_log.append({"method": "deliberate", "question": question, "context": context})
+        # Return decision with updated question if not set
+        if not self._decision.question:
+            return CouncilDecision(
+                question=question,
+                decision=self._decision.decision,
+                transcript=self._decision.transcript
+            )
+        return self._decision
+
+
+# =============================================================================
+# Stub Classes for Standalone Operation
+# =============================================================================
+# These stubs provide minimal implementations that allow this module to run
+# standalone for demonstration. In production, replace with real implementations.
+# =============================================================================
+
+
+class Orchestrator:
+    """Stub Orchestrator for standalone demonstration.
+
+    PRODUCTION: Import from ch05-orchestrator/orchestrator.py:
+        from ch05_orchestrator.orchestrator import SimpleOrchestrator as Orchestrator
+
+    This stub provides minimal functionality for the hybrid module to work
+    standalone. All methods return empty/default values.
+    """
+
+    def __init__(self, llm=None, workers=None):
+        self.llm = llm
+        self.workers = workers or {}
+
+    async def plan(self, task: str) -> dict:
+        """Plan task execution. Returns empty dict in stub."""
+        return {}
+
+    def create_execution_plan(self, subtasks: dict) -> list:
+        """Create execution plan. Returns list of all subtask IDs in stub."""
+        return [list(subtasks.keys())] if subtasks else []
+
+    async def execute_subtask(self, subtask: Any, context: dict) -> Any:
+        """Execute a subtask. Returns empty dict in stub."""
+        return {}
+
+    async def aggregate(self, results: dict, task: str) -> Any:
+        """Aggregate results. Returns results unchanged in stub."""
+        return results
+
+
+class Guardian:
+    """Stub Guardian for standalone demonstration.
+
+    PRODUCTION: Import from ch08-guardian/guardian.py:
+        from ch08_guardian.guardian import SecurityGuardian as Guardian
+
+    This stub approves all validations. Use MockGuardian for testing
+    rejection/modification scenarios.
+    """
+
+    async def validate_input(self, task: str) -> ValidationResponse:
         return ValidationResponse(result=ValidationResult.APPROVED)
 
     async def validate_plan(self, subtasks: dict) -> ValidationResponse:
-        """Validate plan. Placeholder: Always approves."""
         return ValidationResponse(result=ValidationResult.APPROVED)
 
     async def validate_results(self, results: dict) -> ValidationResponse:
-        """Validate results. Placeholder: Always approves."""
         return ValidationResponse(result=ValidationResult.APPROVED)
 
     async def approve_action(self, name: str, arguments: dict) -> ApprovalResponse:
-        """Approve action. Placeholder: Always approves."""
         return ApprovalResponse(approved=True)
 
     async def validate_action_result(self, name: str, result: Any) -> ValidationResponse:
-        """Validate action result. Placeholder: Always approves."""
         return ValidationResponse(result=ValidationResult.APPROVED)
 
     async def check_question(self, question: str, constraints: list) -> QuestionCheckResponse:
-        """Check question. Placeholder: Always allows."""
         return QuestionCheckResponse(allowed=True)
 
     async def validate_decision(self, decision: Any, constraints: list) -> DecisionValidationResponse:
-        """Validate decision. Placeholder: Always compliant."""
         return DecisionValidationResponse(compliant=True, checks=[])
 
 
 class SwarmCoordinator:
-    """Stub for Swarm pattern (from Chapter 7).
+    """Stub SwarmCoordinator for standalone demonstration.
 
-    # Placeholder: In production, import from ch07-swarm/swarm.py
+    PRODUCTION: Import from ch07-swarm/swarm.py:
+        from ch07_swarm.swarm import SwarmCoordinator
+
+    This stub returns empty results. Use MockSwarmCoordinator for testing
+    with controlled outputs.
     """
-    async def run(self, goal: str, max_steps: int = 100) -> Any:
-        """Run swarm exploration. # Placeholder: Returns empty results."""
-        return type('obj', (object,), {
-            'artifacts': [],
-            'exploration_map': {}
-        })()
+
+    async def run(self, goal: str, max_steps: int = 100) -> SwarmResult:
+        return SwarmResult(artifacts=[], exploration_map={})
 
 
 class Council:
-    """Stub for Council pattern (from Chapter 6).
+    """Stub Council for standalone demonstration.
 
-    # Placeholder: In production, import from ch06-council/council.py
+    PRODUCTION: Import from ch06-council/council.py:
+        from ch06_council.council import Council
+
+    This stub returns empty decisions. Use MockCouncil for testing
+    with controlled outputs.
     """
+
     def __init__(self, councilors=None, llm=None):
         self.councilors = councilors or []
         self.llm = llm
 
-    async def deliberate(self, question: str, context: dict = None) -> Any:
-        """Deliberate on question. # Placeholder: Returns empty decision."""
-        return type('obj', (object,), {
-            'decision': None,
-            'transcript': []
-        })()
+    async def deliberate(self, question: str, context: dict = None) -> CouncilDecision:
+        return CouncilDecision(question=question, decision=None, transcript=[])
 
 
 class Subtask:
-    """Stub for Subtask.
+    """Subtask representation for orchestrator patterns.
 
-    # Placeholder: In production, import from ch05-orchestrator/orchestrator.py
+    PRODUCTION: Import from ch05-orchestrator/orchestrator.py or define
+    in a shared types module.
     """
-    def __init__(self, id: str = "", worker_type: str = ""):
+
+    def __init__(self, id: str = "", worker_type: str = "", description: str = ""):
         self.id = id
         self.worker_type = worker_type
+        self.description = description
 
 
 class Artifact:
-    """Stub for Artifact.
+    """Artifact from swarm exploration.
 
-    # Placeholder: In production, define in shared types module
+    PRODUCTION: Define in a shared types module for consistency across
+    all pattern implementations.
     """
-    def __init__(self, content: str = ""):
+
+    def __init__(self, content: str = "", artifact_type: str = "text", metadata: dict = None):
         self.content = content
+        self.artifact_type = artifact_type
+        self.metadata = metadata or {}
 
 
 # =============================================================================

@@ -9,12 +9,249 @@ to AI applications following the official MCP specification.
 Reference: https://modelcontextprotocol.io/specification/2024-11-05
 """
 
+__all__ = [
+    "RateLimiter",
+    "RateLimitExceeded",
+    "DistributedRateLimiter",
+    "GracefulShutdown",
+    "Vendor",
+    "PurchaseOrder",
+    "ProcurementDatabase",
+]
+
 import asyncio
 import json
 import logging
+import os
+import signal
+import time
 from datetime import datetime, timezone
 from typing import Any, Sequence
 from dataclasses import dataclass, asdict
+
+# Optional Redis support for distributed rate limiting
+try:
+    import redis
+    REDIS_AVAILABLE = True
+except ImportError:
+    REDIS_AVAILABLE = False
+
+RATE_LIMIT_REDIS_URL = os.environ.get("RATE_LIMIT_REDIS_URL")
+
+
+# =============================================================================
+# Rate Limiting
+# =============================================================================
+
+class RateLimiter:
+    """Token bucket rate limiter for controlling request throughput."""
+
+    def __init__(self, max_requests: int = 100, window_seconds: float = 60.0):
+        """Initialize rate limiter.
+
+        Args:
+            max_requests: Maximum number of requests allowed per window.
+            window_seconds: Time window in seconds (default: 60.0 for 100 req/min).
+        """
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self.requests: list[float] = []
+
+    def allow(self) -> bool:
+        """Check if a request is allowed under the rate limit.
+
+        Returns:
+            True if the request is allowed, False otherwise.
+        """
+        now = time.time()
+        # Remove expired timestamps
+        self.requests = [t for t in self.requests if now - t < self.window_seconds]
+        if len(self.requests) < self.max_requests:
+            self.requests.append(now)
+            return True
+        return False
+
+    def reset(self):
+        """Reset the rate limiter."""
+        self.requests.clear()
+
+
+class RateLimitExceeded(Exception):
+    """Exception raised when rate limit is exceeded."""
+    pass
+
+
+class DistributedRateLimiter:
+    """Rate limiter with Redis backend for multi-instance deployments.
+
+    Uses sliding window log algorithm for accurate rate limiting.
+    """
+
+    def __init__(self, redis_url: str, key_prefix: str,
+                 max_requests: int, window_seconds: float):
+        """Initialize distributed rate limiter.
+
+        Args:
+            redis_url: Redis connection URL.
+            key_prefix: Prefix for Redis keys.
+            max_requests: Maximum number of requests allowed per window.
+            window_seconds: Time window in seconds.
+        """
+        self.redis = redis.from_url(redis_url)
+        self.key_prefix = key_prefix
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+
+    def allow(self, client_id: str = "global") -> bool:
+        """Check if a request is allowed under the rate limit.
+
+        Args:
+            client_id: Identifier for the client (default: "global" for shared limit).
+
+        Returns:
+            True if the request is allowed, False otherwise.
+        """
+        key = f"{self.key_prefix}:{client_id}"
+        pipe = self.redis.pipeline()
+        now = time.time()
+        window_start = now - self.window_seconds
+
+        # Remove old entries outside the window
+        pipe.zremrangebyscore(key, 0, window_start)
+        # Count current entries in window
+        pipe.zcard(key)
+        # Add current request
+        pipe.zadd(key, {str(now): now})
+        # Set expiry to clean up keys
+        pipe.expire(key, int(self.window_seconds) + 1)
+
+        results = pipe.execute()
+        current_count = results[1]
+        return current_count < self.max_requests
+
+    def reset(self, client_id: str = "global"):
+        """Reset the rate limiter for a specific client.
+
+        Args:
+            client_id: Identifier for the client to reset.
+        """
+        key = f"{self.key_prefix}:{client_id}"
+        self.redis.delete(key)
+
+
+# Initialize rate limiter (distributed if Redis available and configured)
+if REDIS_AVAILABLE and RATE_LIMIT_REDIS_URL:
+    _tool_rate_limiter = DistributedRateLimiter(
+        redis_url=RATE_LIMIT_REDIS_URL,
+        key_prefix="mcp_server",
+        max_requests=100,
+        window_seconds=60.0
+    )
+else:
+    _tool_rate_limiter = RateLimiter(max_requests=100, window_seconds=60.0)
+
+
+# =============================================================================
+# Circuit Breaker for Tool Execution (External Service Calls)
+# =============================================================================
+
+try:
+    from common.resilience import CircuitBreaker, CircuitBreakerOpen
+    _RESILIENCE_AVAILABLE = True
+except ImportError:
+    _RESILIENCE_AVAILABLE = False
+
+    # Inline fallback circuit breaker implementation
+    class CircuitBreakerOpen(Exception):
+        """Exception raised when circuit breaker is open."""
+        def __init__(self, message: str):
+            super().__init__(message)
+
+    class CircuitBreaker:
+        """Simple circuit breaker fallback for when common.resilience is unavailable."""
+
+        def __init__(self, name: str, failure_threshold: int = 5, recovery_timeout: float = 30.0):
+            self.name = name
+            self.failure_threshold = failure_threshold
+            self.recovery_timeout = recovery_timeout
+            self._failure_count = 0
+            self._last_failure_time = 0.0
+            self._is_open = False
+
+        def allow(self) -> bool:
+            """Check if requests are allowed through the circuit breaker."""
+            if not self._is_open:
+                return True
+            # Check if recovery timeout has passed
+            if time.time() - self._last_failure_time >= self.recovery_timeout:
+                self._is_open = False
+                self._failure_count = 0
+                return True
+            return False
+
+        def record_success(self) -> None:
+            """Record a successful call."""
+            self._failure_count = 0
+            self._is_open = False
+
+        def record_failure(self) -> None:
+            """Record a failed call."""
+            self._failure_count += 1
+            self._last_failure_time = time.time()
+            if self._failure_count >= self.failure_threshold:
+                self._is_open = True
+
+
+# Circuit breaker for tool execution (external service calls)
+_tool_execution_circuit_breaker = CircuitBreaker(
+    name="mcp_tool_execution",
+    failure_threshold=5,
+    recovery_timeout=60.0
+)
+
+
+# =============================================================================
+# Graceful Shutdown Handler
+# =============================================================================
+
+class GracefulShutdown:
+    """Handles graceful shutdown for async servers.
+
+    Usage:
+        shutdown = GracefulShutdown()
+        shutdown.setup_signals()
+
+        while not shutdown.shutdown_event.is_set():
+            # process requests
+    """
+
+    def __init__(self):
+        self.shutdown_event = asyncio.Event()
+        self._loop = None
+
+    def setup_signals(self, loop: asyncio.AbstractEventLoop = None):
+        """Register signal handlers for graceful shutdown.
+
+        Args:
+            loop: Event loop to use for thread-safe signal handling
+        """
+        self._loop = loop or asyncio.get_event_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            self._loop.add_signal_handler(sig, self._handle_signal, sig)
+
+    def _handle_signal(self, signum):
+        """Handle shutdown signal by setting the event."""
+        logger.info(f"Received signal {signum}, initiating graceful shutdown")
+        self.shutdown_event.set()
+
+    def cleanup_signals(self):
+        """Remove signal handlers (call during cleanup)."""
+        if self._loop:
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                try:
+                    self._loop.remove_signal_handler(sig)
+                except (ValueError, RuntimeError):
+                    pass
 
 try:
     from mcp.server import Server
@@ -113,6 +350,7 @@ class ProcurementDatabase:
         }
 
         self.purchase_orders: dict[str, PurchaseOrder] = {}
+        self._max_purchase_orders = 100000
         self.po_counter = 1000
 
     async def get_vendor(self, vendor_id: str) -> Vendor | None:
@@ -157,6 +395,12 @@ class ProcurementDatabase:
             approver=approver
         )
 
+        # Evict completed orders if at capacity
+        if len(self.purchase_orders) >= self._max_purchase_orders:
+            completed = [pid for pid, p in self.purchase_orders.items()
+                        if p.status in ("completed", "rejected")]
+            for pid in completed[:1000]:
+                del self.purchase_orders[pid]
         self.purchase_orders[po_id] = po
         return po
 
@@ -326,14 +570,53 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
 
     Each tool call is logged for audit purposes and returns structured
     JSON responses that the LLM can interpret.
+
+    Also handles special health check methods for monitoring.
+    Rate limited to 100 requests per minute.
     """
+    # Handle health check / ping (internal method, not a tool) - not rate limited
+    if name in ("health", "ping"):
+        return [TextContent(
+            type="text",
+            text=json.dumps({
+                "status": "healthy",
+                "server": "procurement-mcp-server",
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            })
+        )]
+
+    # Check rate limit before processing tool calls
+    if not _tool_rate_limiter.allow():
+        logger.warning(f"Rate limit exceeded for tool call: {name}")
+        return [TextContent(
+            type="text",
+            text=json.dumps({
+                "success": False,
+                "error": "Rate limit exceeded. Please try again later.",
+                "isError": True
+            })
+        )]
+
     logger.info(f"Tool called: {name} with arguments: {arguments}")
 
+    # Check circuit breaker before tool execution (protects against cascading failures)
+    if not _tool_execution_circuit_breaker.allow():
+        logger.warning(f"Circuit breaker open for tool execution: {name}")
+        return [TextContent(
+            type="text",
+            text=json.dumps({
+                "success": False,
+                "error": "Tool execution circuit breaker open. Service temporarily unavailable.",
+                "isError": True
+            })
+        )]
+
+    result = None
     try:
         if name == "lookup_vendor":
             vendor = await db.get_vendor(arguments["vendor_id"])
             if vendor:
-                return [TextContent(
+                result = [TextContent(
                     type="text",
                     text=json.dumps({
                         "success": True,
@@ -341,7 +624,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
                     }, indent=2)
                 )]
             else:
-                return [TextContent(
+                result = [TextContent(
                     type="text",
                     text=json.dumps({
                         "success": False,
@@ -354,7 +637,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
                 category=arguments.get("category"),
                 max_risk_score=arguments.get("max_risk_score")
             )
-            return [TextContent(
+            result = [TextContent(
                 type="text",
                 text=json.dumps({
                     "success": True,
@@ -367,43 +650,42 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
             # Validate vendor exists
             vendor = await db.get_vendor(arguments["vendor_id"])
             if not vendor:
-                return [TextContent(
+                result = [TextContent(
                     type="text",
                     text=json.dumps({
                         "success": False,
                         "error": f"Vendor {arguments['vendor_id']} not found"
                     })
                 )]
-
-            if not vendor.active:
-                return [TextContent(
+            elif not vendor.active:
+                result = [TextContent(
                     type="text",
                     text=json.dumps({
                         "success": False,
                         "error": f"Vendor {vendor.name} is not active"
                     })
                 )]
+            else:
+                po = await db.create_purchase_order(
+                    vendor_id=arguments["vendor_id"],
+                    items=arguments["items"],
+                    created_by="mcp-agent",  # In production, get from auth context
+                    approver=arguments["approver"]
+                )
 
-            po = await db.create_purchase_order(
-                vendor_id=arguments["vendor_id"],
-                items=arguments["items"],
-                created_by="mcp-agent",  # In production, get from auth context
-                approver=arguments["approver"]
-            )
-
-            return [TextContent(
-                type="text",
-                text=json.dumps({
-                    "success": True,
-                    "message": f"Purchase order {po.id} created successfully",
-                    "purchase_order": po.to_dict()
-                }, indent=2)
-            )]
+                result = [TextContent(
+                    type="text",
+                    text=json.dumps({
+                        "success": True,
+                        "message": f"Purchase order {po.id} created successfully",
+                        "purchase_order": po.to_dict()
+                    }, indent=2)
+                )]
 
         elif name == "get_purchase_order":
             po = await db.get_purchase_order(arguments["po_id"])
             if po:
-                return [TextContent(
+                result = [TextContent(
                     type="text",
                     text=json.dumps({
                         "success": True,
@@ -411,7 +693,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
                     }, indent=2)
                 )]
             else:
-                return [TextContent(
+                result = [TextContent(
                     type="text",
                     text=json.dumps({
                         "success": False,
@@ -422,35 +704,34 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
         elif name == "approve_purchase_order":
             po = await db.get_purchase_order(arguments["po_id"])
             if not po:
-                return [TextContent(
+                result = [TextContent(
                     type="text",
                     text=json.dumps({
                         "success": False,
                         "error": f"Purchase order {arguments['po_id']} not found"
                     })
                 )]
-
-            if po.status != "pending_approval":
-                return [TextContent(
+            elif po.status != "pending_approval":
+                result = [TextContent(
                     type="text",
                     text=json.dumps({
                         "success": False,
                         "error": f"Cannot approve PO in status '{po.status}'"
                     })
                 )]
-
-            updated_po = await db.update_po_status(arguments["po_id"], "approved")
-            return [TextContent(
-                type="text",
-                text=json.dumps({
-                    "success": True,
-                    "message": f"Purchase order {po.id} approved",
-                    "purchase_order": updated_po.to_dict()
-                }, indent=2)
-            )]
+            else:
+                updated_po = await db.update_po_status(arguments["po_id"], "approved")
+                result = [TextContent(
+                    type="text",
+                    text=json.dumps({
+                        "success": True,
+                        "message": f"Purchase order {po.id} approved",
+                        "purchase_order": updated_po.to_dict()
+                    }, indent=2)
+                )]
 
         else:
-            return [TextContent(
+            result = [TextContent(
                 type="text",
                 text=json.dumps({
                     "success": False,
@@ -458,8 +739,13 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
                 })
             )]
 
-    except Exception as e:
+        # Record success for circuit breaker (service responded, even if business logic failed)
+        _tool_execution_circuit_breaker.record_success()
+        return result
+
+    except (ValueError, KeyError, TypeError, RuntimeError) as e:
         logger.exception(f"Error in tool {name}")
+        _tool_execution_circuit_breaker.record_failure()
         return [TextContent(
             type="text",
             text=json.dumps({
@@ -617,18 +903,47 @@ Please guide me through:
 # =============================================================================
 
 async def main():
-    """Run the MCP server using stdio transport"""
+    """Run the MCP server using stdio transport with graceful shutdown."""
     if not MCP_AVAILABLE:
         raise ImportError("MCP library required. Install with: pip install mcp")
 
+    # Setup graceful shutdown
+    shutdown = GracefulShutdown()
+    loop = asyncio.get_running_loop()
+    shutdown.setup_signals(loop)
+
     logger.info("Starting Procurement MCP Server")
 
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(
-            read_stream,
-            write_stream,
-            server.create_initialization_options()
-        )
+    try:
+        async with stdio_server() as (read_stream, write_stream):
+            # Create a task for the server
+            server_task = asyncio.create_task(
+                server.run(
+                    read_stream,
+                    write_stream,
+                    server.create_initialization_options()
+                )
+            )
+
+            # Wait for either server completion or shutdown signal
+            shutdown_task = asyncio.create_task(shutdown.shutdown_event.wait())
+
+            done, pending = await asyncio.wait(
+                [server_task, shutdown_task],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+
+            # Cancel pending tasks
+            for task in pending:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+            logger.info("Server shutdown complete")
+    finally:
+        shutdown.cleanup_signals()
 
 
 if __name__ == "__main__":

@@ -15,10 +15,37 @@ Implements policy enforcement for AI agents including:
 Based on Chapter 11 of the Agent Architectures book.
 """
 
+__all__ = [
+    "PolicyAction",
+    "PolicyCondition",
+    "Policy",
+    "RateLimitPolicy",
+    "ContentRule",
+    "ContentPolicy",
+    "BudgetPolicy",
+    "Verdict",
+    "PolicyDecision",
+    "PolicyGateway",
+    "PolicyViolationError",
+    "RateLimitedError",
+    "PolicyEnforcedAgent",
+    "ApprovalStatus",
+    "ApprovalRequest",
+    "ApprovalWorkflow",
+    "ApprovalTier",
+    "TieredApprovalPolicy",
+    "SimulationReport",
+    "PolicyDiff",
+    "PolicySimulator",
+    "EscalatingPolicy",
+    "PolicyModifier",
+    "ContextSensitivePolicy",
+]
+
 import asyncio
 import json
 import re
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -90,6 +117,86 @@ except ImportError:
     PROMETHEUS_AVAILABLE = False
     generate_latest = None
     CONTENT_TYPE_LATEST = None
+
+
+# =============================================================================
+# Circuit Breaker for Downstream Service Resilience
+# =============================================================================
+# The policy gateway often depends on downstream services for:
+# - External policy evaluation services
+# - Authentication/authorization services
+# - Logging/audit services
+# - External content moderation APIs
+#
+# Circuit breakers prevent cascading failures when these services are down:
+# - CLOSED: Normal operation, requests proceed to downstream services
+# - OPEN: Service is failing, requests fail fast without attempting connection
+# - HALF_OPEN: Testing if service has recovered
+#
+# This integrates with existing Prometheus metrics for observability.
+# =============================================================================
+
+try:
+    from resilience import CircuitBreaker, CircuitBreakerOpen
+    CIRCUIT_BREAKER_AVAILABLE = True
+except ImportError:
+    # Inline fallback for when resilience module is not available
+    CIRCUIT_BREAKER_AVAILABLE = False
+
+    class CircuitBreakerOpen(Exception):
+        """Exception raised when circuit breaker is open."""
+        def __init__(self, breaker_name: str, time_until_retry: float = 30.0):
+            self.breaker_name = breaker_name
+            self.time_until_retry = time_until_retry
+            super().__init__(f"Circuit breaker '{breaker_name}' is OPEN")
+
+    class CircuitBreaker:
+        """Minimal inline circuit breaker when resilience module unavailable."""
+        def __init__(self, name: str, failure_threshold: int = 5, recovery_timeout: float = 30.0, **kwargs):
+            self.name = name
+            self.failure_threshold = failure_threshold
+            self.recovery_timeout = recovery_timeout
+            self._failure_count = 0
+            self._last_failure_time = 0.0
+            self._state = "closed"
+            import time
+            self._time = time
+
+        @property
+        def state(self):
+            if self._state == "open":
+                if self._time.time() - self._last_failure_time >= self.recovery_timeout:
+                    self._state = "half_open"
+            return self._state
+
+        def record_success(self):
+            self._failure_count = 0
+            self._state = "closed"
+
+        def record_failure(self):
+            self._last_failure_time = self._time.time()
+            self._failure_count += 1
+            if self._failure_count >= self.failure_threshold:
+                self._state = "open"
+
+        async def __aenter__(self):
+            if self.state == "open":
+                raise CircuitBreakerOpen(self.name)
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            if exc_type is None:
+                self.record_success()
+            elif not isinstance(exc_val, CircuitBreakerOpen):
+                self.record_failure()
+            return False
+
+        def get_stats(self):
+            return {
+                "name": self.name,
+                "state": self.state,
+                "failure_count": self._failure_count
+            }
 
 
 # =============================================================================
@@ -469,13 +576,160 @@ class PolicyGateway:
 
     All agent requests flow through the gateway,
     which evaluates applicable policies and makes decisions.
+
+    Circuit Breaker Integration:
+    ---------------------------
+    The gateway uses circuit breakers for downstream service calls to prevent
+    cascading failures. Each downstream service (auth, audit, external policy
+    evaluator) gets its own circuit breaker to isolate failures.
+
+    If a downstream service is failing:
+    - Circuit opens after threshold failures
+    - Subsequent calls fail fast without attempting connection
+    - After recovery timeout, circuit half-opens to test recovery
+    - On success, circuit closes and normal operation resumes
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        circuit_breaker_threshold: int = 5,
+        circuit_breaker_timeout: float = 30.0
+    ):
         self.policies: list[Policy] = []
         self.rate_limiters: dict[str, RateLimitPolicy] = {}
         self.content_policy: ContentPolicy = ContentPolicy()
         self.budget_policies: dict[str, BudgetPolicy] = {}
+
+        # Circuit breakers for downstream services
+        # Each service type gets its own breaker for fault isolation
+        self._circuit_breakers: dict[str, CircuitBreaker] = {}
+        self._cb_threshold = circuit_breaker_threshold
+        self._cb_timeout = circuit_breaker_timeout
+
+        # Pre-create circuit breakers for known downstream service types
+        self._init_circuit_breaker("auth", "Authentication service")
+        self._init_circuit_breaker("audit", "Audit logging service")
+        self._init_circuit_breaker("external_policy", "External policy evaluator")
+        self._init_circuit_breaker("content_moderation", "Content moderation API")
+
+    def _init_circuit_breaker(self, name: str, description: str) -> CircuitBreaker:
+        """
+        Initialize a circuit breaker for a downstream service.
+
+        Args:
+            name: Unique identifier for the service
+            description: Human-readable description (for logging)
+
+        Returns:
+            The created CircuitBreaker instance
+        """
+        breaker = CircuitBreaker(
+            name=f"gateway:{name}",
+            failure_threshold=self._cb_threshold,
+            recovery_timeout=self._cb_timeout
+        )
+        self._circuit_breakers[name] = breaker
+
+        # Update Prometheus metric if available
+        if PROMETHEUS_AVAILABLE:
+            state_value = {"closed": 0, "open": 1, "half_open": 2}.get(
+                str(breaker.state) if isinstance(breaker.state, str) else breaker.state.value,
+                0
+            )
+            CIRCUIT_BREAKER_STATE.labels(breaker_name=name).set(state_value)
+
+        return breaker
+
+    def get_circuit_breaker(self, name: str) -> CircuitBreaker:
+        """
+        Get or create a circuit breaker for a downstream service.
+
+        Args:
+            name: Unique identifier for the service
+
+        Returns:
+            CircuitBreaker instance for this service
+        """
+        if name not in self._circuit_breakers:
+            self._init_circuit_breaker(name, f"Service: {name}")
+        return self._circuit_breakers[name]
+
+    def get_circuit_breaker_stats(self) -> dict[str, dict]:
+        """
+        Get statistics for all circuit breakers.
+
+        Useful for monitoring and debugging. Returns state, failure counts,
+        and other metrics for each circuit breaker.
+        """
+        stats = {}
+        for name, breaker in self._circuit_breakers.items():
+            if hasattr(breaker, 'get_stats'):
+                stats[name] = breaker.get_stats()
+            else:
+                stats[name] = {
+                    "name": name,
+                    "state": str(breaker.state),
+                    "failure_count": getattr(breaker, '_failure_count', 0)
+                }
+
+            # Update Prometheus metric if available
+            if PROMETHEUS_AVAILABLE:
+                state_str = stats[name].get("state", "closed")
+                if hasattr(state_str, 'value'):
+                    state_str = state_str.value
+                state_value = {"closed": 0, "open": 1, "half_open": 2}.get(state_str, 0)
+                CIRCUIT_BREAKER_STATE.labels(breaker_name=name).set(state_value)
+
+        return stats
+
+    async def call_downstream_service(
+        self,
+        service_name: str,
+        call_func: Callable,
+        *args,
+        **kwargs
+    ) -> Any:
+        """
+        Call a downstream service with circuit breaker protection.
+
+        This method wraps any async call to a downstream service with
+        circuit breaker protection. If the service has been failing,
+        calls will fail fast without attempting the connection.
+
+        Args:
+            service_name: Name of the downstream service (for circuit breaker lookup)
+            call_func: Async function to call
+            *args, **kwargs: Arguments to pass to call_func
+
+        Returns:
+            The result from call_func
+
+        Raises:
+            CircuitBreakerOpen: If the circuit breaker is open
+
+        Example:
+            result = await gateway.call_downstream_service(
+                "auth",
+                auth_client.validate_token,
+                token=request_token
+            )
+        """
+        breaker = self.get_circuit_breaker(service_name)
+        try:
+            async with breaker:
+                return await call_func(*args, **kwargs)
+        except CircuitBreakerOpen as e:
+            logger.warning(
+                f"Circuit breaker open for downstream service: {service_name}",
+                extra={"extra_fields": {
+                    "service": service_name,
+                    "retry_in": e.time_until_retry
+                }}
+            )
+            # Update Prometheus metric
+            if PROMETHEUS_AVAILABLE:
+                CIRCUIT_BREAKER_STATE.labels(breaker_name=service_name).set(1)
+            raise
 
     def add_policy(self, policy: Policy):
         """Add a policy to the gateway."""
@@ -690,10 +944,19 @@ class ApprovalRequest:
 class ApprovalWorkflow:
     """Manages human approval for agent actions."""
 
-    def __init__(self, default_timeout_hours: int = 24):
+    def __init__(self, default_timeout_hours: int = 24, max_pending: int = 1000):
         self.pending: dict[str, ApprovalRequest] = {}
         self.default_timeout = default_timeout_hours
         self.notification_handlers: list[Callable] = []
+        self._max_pending = max_pending
+
+    def _cleanup_expired(self):
+        """Remove expired requests to prevent memory growth."""
+        now = datetime.now(timezone.utc)
+        expired = [rid for rid, req in self.pending.items()
+                   if req.expires_at and req.expires_at < now]
+        for rid in expired:
+            del self.pending[rid]
 
     async def request_approval(
         self,
@@ -706,6 +969,7 @@ class ApprovalWorkflow:
         timeout_hours: int = None
     ) -> ApprovalRequest:
         """Create an approval request and notify approvers."""
+        self._cleanup_expired()
 
         request_id = f"approval_{token_urlsafe(8)}"
         timeout = timeout_hours or self.default_timeout

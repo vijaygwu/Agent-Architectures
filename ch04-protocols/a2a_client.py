@@ -17,6 +17,21 @@ Production Notes:
 - Consider service mesh integration for mTLS and observability
 """
 
+__all__ = [
+    "TaskState",
+    "MessageRole",
+    "AgentCapability",
+    "AgentAuthentication",
+    "AgentCard",
+    "A2AMessage",
+    "A2ATask",
+    "A2AClient",
+    "create_a2a_server",
+    "A2ATaskHandler",
+    "InventoryAgentHandler",
+    "INVENTORY_AGENT_CARD",
+]
+
 import asyncio
 import json
 import logging
@@ -26,6 +41,7 @@ from datetime import datetime, timezone
 from typing import Any, Literal
 from dataclasses import dataclass, field, asdict
 from enum import Enum
+from functools import lru_cache
 
 # Import structured logging
 import sys
@@ -37,6 +53,74 @@ try:
 except ImportError:
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger("a2a_client")
+
+# =============================================================================
+# Circuit Breaker for Resilience (Production Pattern)
+# =============================================================================
+# The circuit breaker pattern prevents cascading failures when agent endpoints
+# become unavailable. Each endpoint gets its own circuit breaker to isolate
+# failures - if one agent is down, requests to other agents continue normally.
+#
+# States:
+#   CLOSED: Normal operation, requests flow through
+#   OPEN: Endpoint is failing, requests fail fast without attempting connection
+#   HALF_OPEN: Testing if endpoint has recovered
+# =============================================================================
+
+try:
+    from resilience import CircuitBreaker, CircuitBreakerOpen
+    CIRCUIT_BREAKER_AVAILABLE = True
+except ImportError:
+    # Provide inline fallback if resilience module not available
+    CIRCUIT_BREAKER_AVAILABLE = False
+
+    class CircuitBreakerOpen(Exception):
+        """Exception raised when circuit breaker is open."""
+        def __init__(self, breaker_name: str, time_until_retry: float):
+            self.breaker_name = breaker_name
+            self.time_until_retry = time_until_retry
+            super().__init__(f"Circuit breaker '{breaker_name}' is OPEN")
+
+    class CircuitBreaker:
+        """Minimal inline circuit breaker when resilience module unavailable."""
+        def __init__(self, name: str, failure_threshold: int = 5, recovery_timeout: float = 30.0, **kwargs):
+            self.name = name
+            self.failure_threshold = failure_threshold
+            self.recovery_timeout = recovery_timeout
+            self._failure_count = 0
+            self._last_failure_time = 0.0
+            self._state = "closed"
+            import time
+            self._time = time
+
+        @property
+        def state(self):
+            if self._state == "open":
+                if self._time.time() - self._last_failure_time >= self.recovery_timeout:
+                    self._state = "half_open"
+            return self._state
+
+        def record_success(self):
+            self._failure_count = 0
+            self._state = "closed"
+
+        def record_failure(self):
+            self._last_failure_time = self._time.time()
+            self._failure_count += 1
+            if self._failure_count >= self.failure_threshold:
+                self._state = "open"
+
+        async def __aenter__(self):
+            if self.state == "open":
+                raise CircuitBreakerOpen(self.name, self.recovery_timeout)
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            if exc_type is None:
+                self.record_success()
+            elif not isinstance(exc_val, CircuitBreakerOpen):
+                self.record_failure()
+            return False
 
 
 # =============================================================================
@@ -224,14 +308,52 @@ class A2AClient:
         self,
         agent_id: str,
         agent_name: str,
-        timeout: float = 30.0
+        timeout: float = 30.0,
+        circuit_breaker_threshold: int = 5,
+        circuit_breaker_timeout: float = 30.0
     ):
         self.agent_id = agent_id
         self.agent_name = agent_name
         self.timeout = timeout
-        self._http_client = httpx.AsyncClient(timeout=timeout)
+        # Configure connection pooling for high-throughput agent communication
+        limits = httpx.Limits(
+            max_connections=100,
+            max_keepalive_connections=20,
+            keepalive_expiry=30.0
+        )
+        self._http_client = httpx.AsyncClient(timeout=timeout, limits=limits)
         self._known_agents: dict[str, AgentCard] = {}
         self._active_tasks: dict[str, A2ATask] = {}
+        self._max_known_agents = 1000
+        self._max_active_tasks = 10000
+
+        # Circuit breakers per endpoint URL - isolates failures per agent
+        # This prevents a single failing agent from affecting communication
+        # with other healthy agents
+        self._circuit_breakers: dict[str, CircuitBreaker] = {}
+        self._cb_threshold = circuit_breaker_threshold
+        self._cb_timeout = circuit_breaker_timeout
+
+    def _get_circuit_breaker(self, endpoint: str) -> CircuitBreaker:
+        """
+        Get or create a circuit breaker for an endpoint.
+
+        Each agent endpoint gets its own circuit breaker to isolate failures.
+        If agent A is down, requests to agent B continue normally.
+
+        Args:
+            endpoint: The base URL of the agent endpoint
+
+        Returns:
+            CircuitBreaker instance for this endpoint
+        """
+        if endpoint not in self._circuit_breakers:
+            self._circuit_breakers[endpoint] = CircuitBreaker(
+                name=f"a2a:{endpoint}",
+                failure_threshold=self._cb_threshold,
+                recovery_timeout=self._cb_timeout
+            )
+        return self._circuit_breakers[endpoint]
 
     async def __aenter__(self):
         """Support async context manager."""
@@ -265,7 +387,7 @@ class A2AClient:
         try:
             response = await asyncio.wait_for(
                 self._http_client.get(well_known_url),
-                timeout=30.0
+                timeout=self.timeout
             )
             if response.status_code == 200:
                 card = AgentCard.from_dict(response.json())
@@ -286,6 +408,10 @@ class A2AClient:
             )
         response.raise_for_status()
         card = AgentCard.from_dict(response.json())
+        # Evict oldest if at capacity
+        if len(self._known_agents) >= self._max_known_agents:
+            oldest_key = next(iter(self._known_agents))
+            del self._known_agents[oldest_key]
         self._known_agents[card.name] = card
         return card
 
@@ -383,26 +509,42 @@ class A2AClient:
             updated_at=now
         )
 
-        # Send to target agent
+        # Send to target agent with circuit breaker protection
+        # The circuit breaker will fail fast if this endpoint has been failing
+        circuit_breaker = self._get_circuit_breaker(card.endpoint)
         try:
-            response = await asyncio.wait_for(
-                self._http_client.post(
-                    f"{card.endpoint}/tasks",
-                    json=task.to_dict(),
-                    headers=await self._get_auth_headers(card)
-                ),
-                timeout=30.0
+            async with circuit_breaker:
+                response = await asyncio.wait_for(
+                    self._http_client.post(
+                        f"{card.endpoint}/tasks",
+                        json=task.to_dict(),
+                        headers=await self._get_auth_headers(card)
+                    ),
+                    timeout=30.0
+                )
+                response.raise_for_status()
+        except CircuitBreakerOpen as e:
+            # Circuit is open - fail fast without attempting connection
+            logger.warning(
+                f"Circuit breaker open for {card.name}",
+                extra={"extra_fields": {"endpoint": card.endpoint, "retry_in": e.time_until_retry}}
             )
+            raise
         except asyncio.TimeoutError:
             raise TimeoutError(
                 f"HTTP request timed out after 30 seconds creating task on {card.name}"
             )
-        response.raise_for_status()
 
         # Update task with response
         response_data = response.json()
         task.state = TaskState(response_data.get("state", "pending"))
 
+        # Evict completed tasks if at capacity
+        if len(self._active_tasks) >= self._max_active_tasks:
+            completed = [tid for tid, t in self._active_tasks.items()
+                        if t.state in (TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELLED)]
+            for tid in completed[:100]:  # Remove up to 100 completed tasks
+                del self._active_tasks[tid]
         self._active_tasks[task_id] = task
         return task
 
@@ -431,20 +573,29 @@ class A2AClient:
             metadata=metadata or {}
         )
 
+        # Use circuit breaker for message sending
+        circuit_breaker = self._get_circuit_breaker(card.endpoint)
         try:
-            response = await asyncio.wait_for(
-                self._http_client.post(
-                    f"{card.endpoint}/tasks/{task_id}/messages",
-                    json=msg.to_dict(),
-                    headers=await self._get_auth_headers(card)
-                ),
-                timeout=30.0
+            async with circuit_breaker:
+                response = await asyncio.wait_for(
+                    self._http_client.post(
+                        f"{card.endpoint}/tasks/{task_id}/messages",
+                        json=msg.to_dict(),
+                        headers=await self._get_auth_headers(card)
+                    ),
+                    timeout=30.0
+                )
+                response.raise_for_status()
+        except CircuitBreakerOpen as e:
+            logger.warning(
+                f"Circuit breaker open for {card.name} while sending message",
+                extra={"extra_fields": {"task_id": task_id, "retry_in": e.time_until_retry}}
             )
+            raise
         except asyncio.TimeoutError:
             raise TimeoutError(
                 f"HTTP request timed out after 30 seconds sending message to task {task_id}"
             )
-        response.raise_for_status()
 
         task.messages.append(msg)
         task.updated_at = datetime.now(timezone.utc).isoformat()
@@ -475,19 +626,28 @@ class A2AClient:
         if not card:
             raise ValueError(f"Unknown agent: {task.target_agent}")
 
+        # Use circuit breaker to protect against repeatedly polling a failing endpoint
+        circuit_breaker = self._get_circuit_breaker(card.endpoint)
         try:
-            response = await asyncio.wait_for(
-                self._http_client.get(
-                    f"{card.endpoint}/tasks/{task_id}",
-                    headers=await self._get_auth_headers(card)
-                ),
-                timeout=30.0
+            async with circuit_breaker:
+                response = await asyncio.wait_for(
+                    self._http_client.get(
+                        f"{card.endpoint}/tasks/{task_id}",
+                        headers=await self._get_auth_headers(card)
+                    ),
+                    timeout=30.0
+                )
+                response.raise_for_status()
+        except CircuitBreakerOpen as e:
+            logger.warning(
+                f"Circuit breaker open for {card.name} while getting task status",
+                extra={"extra_fields": {"task_id": task_id, "retry_in": e.time_until_retry}}
             )
+            raise
         except asyncio.TimeoutError:
             raise TimeoutError(
                 f"HTTP request timed out after 30 seconds getting status for task {task_id}"
             )
-        response.raise_for_status()
 
         data = response.json()
         task.state = TaskState(data["state"])
@@ -507,19 +667,28 @@ class A2AClient:
         if not card:
             raise ValueError(f"Unknown agent: {task.target_agent}")
 
+        # Use circuit breaker for cancellation
+        circuit_breaker = self._get_circuit_breaker(card.endpoint)
         try:
-            response = await asyncio.wait_for(
-                self._http_client.post(
-                    f"{card.endpoint}/tasks/{task_id}/cancel",
-                    headers=await self._get_auth_headers(card)
-                ),
-                timeout=30.0
+            async with circuit_breaker:
+                response = await asyncio.wait_for(
+                    self._http_client.post(
+                        f"{card.endpoint}/tasks/{task_id}/cancel",
+                        headers=await self._get_auth_headers(card)
+                    ),
+                    timeout=30.0
+                )
+                response.raise_for_status()
+        except CircuitBreakerOpen as e:
+            logger.warning(
+                f"Circuit breaker open for {card.name} while cancelling task",
+                extra={"extra_fields": {"task_id": task_id, "retry_in": e.time_until_retry}}
             )
+            raise
         except asyncio.TimeoutError:
             raise TimeoutError(
                 f"HTTP request timed out after 30 seconds cancelling task {task_id}"
             )
-        response.raise_for_status()
 
         task.state = TaskState.CANCELLED
         task.updated_at = datetime.now(timezone.utc).isoformat()

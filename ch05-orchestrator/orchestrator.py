@@ -36,6 +36,25 @@ Production Notes:
 - Consider adding task timeouts and cancellation support
 """
 
+__all__ = [
+    "WorkerType",
+    "Subtask",
+    "OrchestratorState",
+    "PersistenceBackend",
+    "InMemoryPersistence",
+    "RedisPersistence",
+    "BaseWorker",
+    "ResearchWorker",
+    "AnalysisWorker",
+    "WritingWorker",
+    "CodeWorker",
+    "ReviewWorker",
+    "TaskPlanner",
+    "ResultAggregator",
+    "MultiAgentOrchestrator",
+    "SimpleOrchestrator",
+]
+
 import asyncio
 import json
 import logging
@@ -71,6 +90,74 @@ except ImportError:
     class _NoOpTracer:
         def start_as_current_span(self, n, **kw): return _NoOpSpan()
     tracer = _NoOpTracer()
+
+# =============================================================================
+# Circuit Breaker for Worker Resilience
+# =============================================================================
+# Each worker type gets its own circuit breaker to isolate failures.
+# If the research worker is failing (e.g., search API down), the circuit
+# opens and fails fast, but analysis and writing workers continue normally.
+#
+# This prevents:
+# - Wasting resources on workers that are consistently failing
+# - Cascading failures across the orchestrator
+# - Long timeouts when a service is known to be down
+# =============================================================================
+
+try:
+    from resilience import CircuitBreaker, CircuitBreakerOpen
+    CIRCUIT_BREAKER_AVAILABLE = True
+except ImportError:
+    # Inline fallback for when resilience module is not available
+    CIRCUIT_BREAKER_AVAILABLE = False
+
+    class CircuitBreakerOpen(Exception):
+        """Exception raised when circuit breaker is open."""
+        def __init__(self, breaker_name: str, time_until_retry: float = 30.0):
+            self.breaker_name = breaker_name
+            self.time_until_retry = time_until_retry
+            super().__init__(f"Circuit breaker '{breaker_name}' is OPEN")
+
+    class CircuitBreaker:
+        """Minimal inline circuit breaker when resilience module unavailable."""
+        def __init__(self, name: str, failure_threshold: int = 5, recovery_timeout: float = 30.0, **kwargs):
+            self.name = name
+            self.failure_threshold = failure_threshold
+            self.recovery_timeout = recovery_timeout
+            self._failure_count = 0
+            self._last_failure_time = 0.0
+            self._state = "closed"
+            import time
+            self._time = time
+
+        @property
+        def state(self):
+            if self._state == "open":
+                if self._time.time() - self._last_failure_time >= self.recovery_timeout:
+                    self._state = "half_open"
+            return self._state
+
+        def record_success(self):
+            self._failure_count = 0
+            self._state = "closed"
+
+        def record_failure(self):
+            self._last_failure_time = self._time.time()
+            self._failure_count += 1
+            if self._failure_count >= self.failure_threshold:
+                self._state = "open"
+
+        async def __aenter__(self):
+            if self.state == "open":
+                raise CircuitBreakerOpen(self.name)
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            if exc_type is None:
+                self.record_success()
+            elif not isinstance(exc_val, CircuitBreakerOpen):
+                self.record_failure()
+            return False
 
 try:
     from langgraph.graph import StateGraph, END
@@ -400,6 +487,10 @@ class TaskPlanner:
             - List of subtasks
             - Execution phases (groups of subtask IDs that can run in parallel)
         """
+        # Input validation
+        if not task or not task.strip():
+            raise ValueError("Task cannot be empty")
+
         # In production, use LLM to analyze task and create plan
         # This is a demonstration of the planning logic
 
@@ -518,7 +609,18 @@ class MultiAgentOrchestrator:
     - Error handling and recovery
     """
 
-    def __init__(self, persistence: PersistenceBackend | None = None):
+    def __init__(
+        self,
+        persistence: PersistenceBackend | None = None,
+        circuit_breaker_threshold: int = 3,
+        circuit_breaker_timeout: float = 60.0
+    ):
+        # Input validation
+        if circuit_breaker_threshold <= 0:
+            raise ValueError("circuit_breaker_threshold must be positive")
+        if circuit_breaker_timeout <= 0:
+            raise ValueError("circuit_breaker_timeout must be positive")
+
         self.planner = TaskPlanner()
         self.aggregator = ResultAggregator()
         self._persistence = persistence or InMemoryPersistence()
@@ -530,6 +632,17 @@ class MultiAgentOrchestrator:
             WorkerType.WRITING: WritingWorker(),
             WorkerType.CODE: CodeWorker(),
             WorkerType.REVIEW: ReviewWorker(),
+        }
+
+        # Circuit breakers per worker type - isolates failures by worker category
+        # If research workers fail repeatedly, analysis workers continue normally
+        self._worker_circuit_breakers: dict[WorkerType, CircuitBreaker] = {
+            worker_type: CircuitBreaker(
+                name=f"worker:{worker_type.value}",
+                failure_threshold=circuit_breaker_threshold,
+                recovery_timeout=circuit_breaker_timeout
+            )
+            for worker_type in WorkerType
         }
 
         # Build the orchestration graph
@@ -639,7 +752,13 @@ class MultiAgentOrchestrator:
         timeout_seconds: float = 120.0
     ) -> Any:
         """
-        Execute a single subtask with a worker, with retry logic and timeout.
+        Execute a single subtask with a worker, with circuit breaker, retry logic and timeout.
+
+        The circuit breaker pattern protects against repeatedly failing workers:
+        - If a worker type fails repeatedly, the circuit opens
+        - Subsequent requests to that worker type fail fast
+        - After recovery timeout, the circuit half-opens to test recovery
+        - Other worker types continue operating normally (fault isolation)
 
         Args:
             worker: The worker to execute the subtask
@@ -652,38 +771,70 @@ class MultiAgentOrchestrator:
             The result from the worker
 
         Raises:
+            CircuitBreakerOpen: If worker's circuit breaker is open
             TimeoutError: If all retry attempts timeout
             Exception: If all retry attempts fail with errors
         """
+        # Input validation
+        if max_retries <= 0:
+            raise ValueError("max_retries must be positive")
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
+
         with tracer.start_as_current_span(f"subtask.{subtask.id}") as span:
             span.set_attribute("worker.type", worker.__class__.__name__)
             span.set_attribute("subtask.id", subtask.id)
             span.set_attribute("subtask.type", subtask.worker_type.value)
             span.set_attribute("max_retries", max_retries)
 
+            # Get the circuit breaker for this worker type
+            circuit_breaker = self._worker_circuit_breakers[subtask.worker_type]
+            span.set_attribute("circuit_breaker.state", circuit_breaker.state.value if hasattr(circuit_breaker.state, 'value') else str(circuit_breaker.state))
+
             subtask.status = "in_progress"
             last_error = None
 
-            for attempt in range(max_retries):
-                span.add_event(f"attempt.{attempt + 1}")
-                try:
-                    result = await asyncio.wait_for(
-                        worker.execute(subtask, context),
-                        timeout=timeout_seconds
-                    )
-                    span.set_attribute("status", "success")
-                    return result
-                except asyncio.TimeoutError:
-                    last_error = TimeoutError(
-                        f"Worker {worker.__class__.__name__} timed out on subtask {subtask.id} "
-                        f"(attempt {attempt + 1}/{max_retries})"
-                    )
-                except Exception as e:
-                    last_error = e
+            # Check circuit breaker before attempting work
+            # This fails fast if this worker type has been failing
+            try:
+                async with circuit_breaker:
+                    for attempt in range(max_retries):
+                        span.add_event(f"attempt.{attempt + 1}")
+                        try:
+                            result = await asyncio.wait_for(
+                                worker.execute(subtask, context),
+                                timeout=timeout_seconds
+                            )
+                            span.set_attribute("status", "success")
+                            return result
+                        except asyncio.TimeoutError:
+                            last_error = TimeoutError(
+                                f"Worker {worker.__class__.__name__} timed out on subtask {subtask.id} "
+                                f"(attempt {attempt + 1}/{max_retries})"
+                            )
+                        except Exception as e:
+                            last_error = e
 
-                # Exponential backoff before retry
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(2 ** attempt)
+                        # Exponential backoff before retry
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(2 ** attempt)
+
+                    # All retries exhausted - raise the last error
+                    # The circuit breaker context manager will record this as a failure
+                    raise last_error
+
+            except CircuitBreakerOpen as e:
+                # Circuit is open - fail fast without attempting work
+                logger.warning(
+                    f"Circuit breaker open for worker type {subtask.worker_type.value}",
+                    extra={"extra_fields": {
+                        "subtask_id": subtask.id,
+                        "worker_type": subtask.worker_type.value,
+                        "retry_in": e.time_until_retry
+                    }}
+                )
+                span.set_attribute("status", "circuit_breaker_open")
+                raise
 
             span.set_attribute("status", "failed")
             span.set_attribute("error", str(last_error))
@@ -725,6 +876,10 @@ class MultiAgentOrchestrator:
         Returns:
             Final state including output
         """
+        # Input validation
+        if not task or not task.strip():
+            raise ValueError("Task cannot be empty")
+
         initial_state: OrchestratorState = {
             "task": task,
             "context": context or {},
@@ -771,6 +926,10 @@ class SimpleOrchestrator:
 
     async def run(self, task: str, context: dict | None = None, task_id: str | None = None) -> dict:
         """Run task through orchestration pipeline with optional persistence."""
+        # Input validation
+        if not task or not task.strip():
+            raise ValueError("Task cannot be empty")
+
         context = context or {}
         task_id = task_id or str(uuid.uuid4())
         results = {}

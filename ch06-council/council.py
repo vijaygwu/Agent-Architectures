@@ -12,6 +12,31 @@ The council pattern enables multiple agents to:
 Use this pattern when single-agent decisions aren't trustworthy enough.
 """
 
+__all__ = [
+    "VotingMechanism",
+    "ExpertiseArea",
+    "Councilor",
+    "CouncilConfig",
+    "Proposal",
+    "Critique",
+    "Vote",
+    "RankedVote",
+    "VoteResult",
+    "DeliberationRound",
+    "CouncilDecision",
+    "TranscriptEntry",
+    "ConsensusResult",
+    "Position",
+    "DeliberationState",
+    "CouncilMember",
+    "Council",
+    "create_technical_council",
+    "create_business_council",
+    "create_product_council",
+    "BOOK_COUNCILORS",
+    "SECURITY_COUNCILOR",
+]
+
 import asyncio
 import json
 import logging
@@ -69,6 +94,139 @@ except ImportError:
                 raise last_error
             return wrapper
         return decorator
+
+
+# =============================================================================
+# Circuit Breaker for LLM Resilience
+# =============================================================================
+# The circuit breaker pattern prevents repeated failures when the LLM API is
+# having issues. This is critical for council deliberations because:
+#
+# 1. Fail Fast: If the LLM API is down, don't waste time waiting for timeouts
+#    on every council member's proposal, critique, and vote.
+#
+# 2. Recovery Detection: Automatically detect when the API recovers and
+#    resume normal operation.
+#
+# 3. Cost Control: Prevent runaway retry costs when the API is having issues.
+#
+# Each CouncilMember shares a class-level circuit breaker to aggregate
+# failure signals across all council members.
+# =============================================================================
+
+import os
+
+try:
+    from common.resilience import CircuitBreaker, CircuitBreakerOpen, RateLimiter, RateLimitExceeded
+    RESILIENCE_AVAILABLE = True
+except ImportError:
+    # Inline fallback for when resilience module is not available
+    RESILIENCE_AVAILABLE = False
+
+    class CircuitBreakerOpen(Exception):
+        """Exception raised when circuit breaker is open."""
+        def __init__(self, breaker_name: str, time_until_retry: float = 30.0):
+            self.breaker_name = breaker_name
+            self.time_until_retry = time_until_retry
+            super().__init__(f"Circuit breaker '{breaker_name}' is OPEN")
+
+    class CircuitBreaker:
+        """Minimal inline circuit breaker when resilience module unavailable."""
+        def __init__(self, name: str, failure_threshold: int = 5, recovery_timeout: float = 30.0, **kwargs):
+            self.name = name
+            self.failure_threshold = failure_threshold
+            self.recovery_timeout = recovery_timeout
+            self._failure_count = 0
+            self._last_failure_time = 0.0
+            self._state = "closed"
+            import time
+            self._time = time
+
+        @property
+        def state(self):
+            if self._state == "open":
+                if self._time.time() - self._last_failure_time >= self.recovery_timeout:
+                    self._state = "half_open"
+            return self._state
+
+        def record_success(self):
+            self._failure_count = 0
+            self._state = "closed"
+
+        def record_failure(self):
+            self._last_failure_time = self._time.time()
+            self._failure_count += 1
+            if self._failure_count >= self.failure_threshold:
+                self._state = "open"
+
+        async def __aenter__(self):
+            if self.state == "open":
+                raise CircuitBreakerOpen(self.name)
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            if exc_type is None:
+                self.record_success()
+            elif not isinstance(exc_val, CircuitBreakerOpen):
+                self.record_failure()
+            return False
+
+    class RateLimitExceeded(Exception):
+        """Exception raised when rate limit is exceeded."""
+        def __init__(self, limiter_name: str, retry_after: float = 1.0):
+            self.limiter_name = limiter_name
+            self.retry_after = retry_after
+            super().__init__(f"Rate limit exceeded for '{limiter_name}', retry after {retry_after:.2f}s")
+
+    class RateLimiter:
+        """Minimal inline token bucket rate limiter when resilience module unavailable."""
+        def __init__(self, name: str, max_tokens: float = 10.0, refill_rate: float = 1.0):
+            self.name = name
+            self.max_tokens = max_tokens
+            self.refill_rate = refill_rate
+            self._tokens = max_tokens
+            import time
+            self._time = time
+            self._last_refill = time.monotonic()
+
+        def _refill(self):
+            now = self._time.monotonic()
+            elapsed = now - self._last_refill
+            self._tokens = min(self.max_tokens, self._tokens + elapsed * self.refill_rate)
+            self._last_refill = now
+
+        def allow(self, tokens: float = 1.0) -> bool:
+            """Check if request is allowed (non-blocking)."""
+            self._refill()
+            if self._tokens >= tokens:
+                self._tokens -= tokens
+                return True
+            return False
+
+        def get_wait_time(self, tokens: float = 1.0) -> float:
+            """Calculate time until tokens available."""
+            self._refill()
+            if self._tokens >= tokens:
+                return 0.0
+            return (tokens - self._tokens) / self.refill_rate
+
+
+# Shared circuit breaker for LLM API calls across all council members
+# This aggregates failure signals - if any council member experiences
+# repeated LLM failures, all members will fail fast until recovery
+_LLM_CIRCUIT_BREAKER = CircuitBreaker(
+    name="council:llm_api",
+    failure_threshold=5,       # Open after 5 consecutive failures
+    recovery_timeout=60.0      # Try again after 60 seconds
+)
+
+# Shared rate limiter for LLM API calls (configurable via environment variable)
+# Default: 60 requests per minute (refill_rate=1.0 means 1 token/second)
+_llm_rate_limiter = RateLimiter(
+    name="council:llm_rate",
+    max_tokens=float(os.environ.get("COUNCIL_LLM_RATE_LIMIT", "60")),
+    refill_rate=float(os.environ.get("COUNCIL_LLM_RATE_LIMIT", "60")) / 60.0  # tokens per second
+)
 
 
 # =============================================================================
@@ -145,6 +303,13 @@ class CouncilConfig:
     min_confidence_threshold: float = 0.7
     require_human_for_deadlock: bool = True
     require_human_above_impact: str | None = "high"  # low, medium, high, critical
+
+    def __post_init__(self):
+        """Validate configuration after initialization."""
+        if self.max_deliberation_rounds <= 0:
+            raise ValueError("max_deliberation_rounds must be positive")
+        if not (0 <= self.min_confidence_threshold <= 1):
+            raise ValueError("min_confidence_threshold must be between 0 and 1")
 
 
 # =============================================================================
@@ -340,6 +505,12 @@ class CouncilMember:
         model: str = "claude-sonnet-4",
         mock_mode: bool = False
     ):
+        # Input validation
+        if not member_id or not member_id.strip():
+            raise ValueError("member_id cannot be empty")
+        if not name or not name.strip():
+            raise ValueError("name cannot be empty")
+
         self.member_id = member_id
         self.name = name
         self.expertise = expertise
@@ -347,8 +518,17 @@ class CouncilMember:
         self.model = model
         self.mock_mode = mock_mode
         self.client = None
+
+        # Per-member circuit breaker for failure isolation
+        # Each council member has their own circuit breaker to prevent
+        # one failing member from affecting others
+        self._circuit_breaker = CircuitBreaker(
+            name=f"council_member_{member_id}",
+            failure_threshold=3,
+            recovery_timeout=30.0
+        )
+
         if not mock_mode:
-            import os
             if not ANTHROPIC_AVAILABLE:
                 raise ImportError(
                     "anthropic library required. Install with: pip install anthropic\n"
@@ -383,7 +563,13 @@ class CouncilMember:
         operation_name: str
     ) -> str:
         """
-        Make an LLM API call with retry logic and timeout.
+        Make an LLM API call with circuit breakers, rate limiting, retry logic and timeout.
+
+        Resilience layers (in order):
+        1. Rate limiter: Prevents exceeding LLM API rate limits (shared across all members)
+        2. Per-member circuit breaker: Isolates failures for each council member
+        3. Shared circuit breaker: Aggregates failure signals across all members
+        4. Retry with backoff: Handles transient failures (via decorator)
 
         Args:
             system_prompt: The system prompt for the LLM
@@ -392,18 +578,53 @@ class CouncilMember:
 
         Returns:
             The raw text response from the LLM
+
+        Raises:
+            RateLimitExceeded: If LLM rate limit is exceeded
+            CircuitBreakerOpen: If circuit breaker is open (fail fast)
+            TimeoutError: If the API call times out
         """
-        try:
-            response = await asyncio.wait_for(
-                self.client.messages.create(
-                    model=self.model,
-                    max_tokens=1024,
-                    system=system_prompt,
-                    messages=[{"role": "user", "content": user_content}]
-                ),
-                timeout=60.0
+        # Check rate limiter first (shared across all council members)
+        if not _llm_rate_limiter.allow():
+            wait_time = _llm_rate_limiter.get_wait_time()
+            logger.warning(
+                f"LLM rate limit exceeded in {operation_name}",
+                extra={"extra_fields": {
+                    "member_id": self.member_id,
+                    "operation": operation_name,
+                    "retry_after": wait_time
+                }}
             )
-            return response.content[0].text
+            raise RateLimitExceeded(_llm_rate_limiter.name, wait_time)
+
+        # Use per-member circuit breaker for failure isolation
+        # This prevents one failing member from blocking others
+        try:
+            async with self._circuit_breaker:
+                # Also use shared circuit breaker for global LLM API health
+                async with _LLM_CIRCUIT_BREAKER:
+                    response = await asyncio.wait_for(
+                        self.client.messages.create(
+                            model=self.model,
+                            max_tokens=1024,
+                            system=system_prompt,
+                            messages=[{"role": "user", "content": user_content}]
+                        ),
+                        timeout=60.0
+                    )
+                    return response.content[0].text
+        except CircuitBreakerOpen as e:
+            # Circuit is open - fail fast
+            logger.warning(
+                f"Circuit breaker open in {operation_name}",
+                extra={"extra_fields": {
+                    "member_id": self.member_id,
+                    "operation": operation_name,
+                    "breaker_name": e.breaker_name,
+                    "retry_in": e.time_until_retry
+                }}
+            )
+            raise
         except asyncio.TimeoutError:
             logger.warning(
                 f"LLM timeout in {operation_name}",
@@ -425,6 +646,10 @@ class CouncilMember:
         If previous proposals exist (in later rounds), consider them
         when formulating the response.
         """
+        # Input validation
+        if not question or not question.strip():
+            raise ValueError("Question cannot be empty")
+
         with tracer.start_as_current_span(f"council.propose.{self.member_id}") as span:
             span.set_attribute("member.id", self.member_id)
             span.set_attribute("member.expertise", self.expertise.value)
@@ -504,6 +729,12 @@ Respond in JSON format:
 
         Provide assessment, concerns, and constructive suggestions.
         """
+        # Input validation
+        if not question or not question.strip():
+            raise ValueError("Question cannot be empty")
+        if proposal is None:
+            raise ValueError("Proposal cannot be None")
+
         with tracer.start_as_current_span(f"council.critique.{self.member_id}") as span:
             span.set_attribute("member.id", self.member_id)
             span.set_attribute("target.proposal_id", proposal.id)
@@ -582,6 +813,12 @@ Context: {json.dumps(context)}"""
         """
         Vote on a proposal after reviewing all critiques.
         """
+        # Input validation
+        if not question or not question.strip():
+            raise ValueError("Question cannot be empty")
+        if proposal is None:
+            raise ValueError("Proposal cannot be None")
+
         with tracer.start_as_current_span(f"council.vote.{self.member_id}") as span:
             span.set_attribute("member.id", self.member_id)
             span.set_attribute("proposal.id", proposal.id)
@@ -664,6 +901,10 @@ class Council:
         config: CouncilConfig,
         members: list[CouncilMember]
     ):
+        # Input validation
+        if not members or len(members) == 0:
+            raise ValueError("Council must have at least one member")
+
         self.config = config
         self.members = members
         self.deliberation_log: list[DeliberationRound] = []
@@ -698,6 +939,10 @@ class Council:
         Returns:
             CouncilDecision with final outcome and audit trail
         """
+        # Input validation
+        if not question or not question.strip():
+            raise ValueError("Question cannot be empty")
+
         decision_id = f"decision_{uuid.uuid4().hex[:8]}"
         self.deliberation_log = []
 
