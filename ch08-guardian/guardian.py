@@ -615,7 +615,7 @@ class ContentGuardian(Guardian):
         patterns = {
             "ssn": r"\b\d{3}-\d{2}-\d{4}\b",
             "credit_card": r"\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b",
-            "email": r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b",
+            "email": r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
             "phone": r"\b\d{3}[-.]?\d{3}[-.]?\d{4}\b",
         }
 
@@ -847,7 +847,16 @@ class CostGuardian(Guardian):
         self.cost_calculator = config.get("cost_calculator", self.default_cost_calculator)
 
     async def validate(self, action: ActionRequest) -> ValidationResult:
-        """Check if action is within budget limits."""
+        """Check if action is within budget limits.
+
+        Three zones per limit:
+          cost <= soft_mult * limit         -> approve (well under)
+          soft_mult * limit < cost <= limit -> escalate (warning zone)
+          cost > limit                      -> deny (hard breach)
+
+        The same zones apply to per-action, per-agent, and global limits;
+        we choose the most severe outcome across all three.
+        """
         # Estimate cost
         estimated_cost = await self.estimate_cost(action)
 
@@ -857,51 +866,61 @@ class CostGuardian(Guardian):
                 reason="No cost associated with action"
             )
 
-        # Check against budgets
-        violations = []
+        soft_mult = self.budgets.get("soft_limit_multiplier", 0.8)
+
+        def classify(cost_after: float, limit: float) -> str:
+            if cost_after > limit:
+                return "breach"
+            if cost_after > soft_mult * limit:
+                return "warn"
+            return "ok"
+
+        violations: list[str] = []
+        warnings: list[str] = []
+
+        def record(zone: str, msg: str) -> None:
+            (violations if zone == "breach" else warnings).append(msg)
 
         # Per-action limit
         key = f"per_action_{action.action_type}"
         default = self.budgets.get("per_action_default", float("inf"))
         action_limit = self.budgets.get(key, default)
-        if estimated_cost > action_limit:
-            violations.append(
-                f"Action cost ${estimated_cost:.2f} "
-                f"exceeds limit ${action_limit:.2f}")
+        zone = classify(estimated_cost, action_limit)
+        if zone != "ok":
+            record(zone, (f"Per-action cost ${estimated_cost:.2f} "
+                          f"is at {zone} of limit ${action_limit:.2f}"))
 
         # Per-agent limit (hourly)
         agent_spent = self.get_spending(action.agent_id, timedelta(hours=1))
         agent_limit = self.budgets.get("per_agent_hourly", float("inf"))
-        if agent_spent + estimated_cost > agent_limit:
+        zone = classify(agent_spent + estimated_cost, agent_limit)
+        if zone != "ok":
             total = agent_spent + estimated_cost
-            violations.append(
-                f"Agent {action.agent_id} would exceed hourly limit: "
-                f"${total:.2f} > ${agent_limit:.2f}")
+            record(zone, (f"Agent {action.agent_id} would be at {zone} of "
+                          f"hourly limit: ${total:.2f} vs ${agent_limit:.2f}"))
 
         # Global daily limit
         global_spent = self.get_spending("global", timedelta(days=1))
         global_limit = self.budgets.get("global_daily", float("inf"))
-        if global_spent + estimated_cost > global_limit:
+        zone = classify(global_spent + estimated_cost, global_limit)
+        if zone != "ok":
             total = global_spent + estimated_cost
-            violations.append(
-                f"Would exceed daily global limit: "
-                f"${total:.2f} > ${global_limit:.2f}")
+            record(zone, (f"Global daily spend would be at {zone}: "
+                          f"${total:.2f} vs ${global_limit:.2f}"))
 
         if violations:
-            # Check if within soft limit (escalate) vs hard limit
-            soft_mult = self.budgets.get("soft_limit_multiplier", 0.8)
-            if estimated_cost <= action_limit * soft_mult:
-                return ValidationResult(
-                    decision=GuardianDecision.ESCALATE,
-                    reason="Approaching budget limits",
-                    violations=violations,
-                    metadata={"estimated_cost": estimated_cost}
-                )
             return ValidationResult(
                 decision=GuardianDecision.DENY,
                 reason="Budget limit exceeded",
-                violations=violations,
-                metadata={"estimated_cost": estimated_cost}
+                violations=violations + warnings,
+                metadata={"estimated_cost": estimated_cost},
+            )
+        if warnings:
+            return ValidationResult(
+                decision=GuardianDecision.ESCALATE,
+                reason="Approaching budget limits",
+                violations=warnings,
+                metadata={"estimated_cost": estimated_cost},
             )
 
         # Record the anticipated spending

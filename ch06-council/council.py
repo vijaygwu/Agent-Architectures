@@ -234,8 +234,15 @@ _llm_rate_limiter = RateLimiter(
 # =============================================================================
 
 class VotingMechanism(str, Enum):
+    # Naming note: PLURALITY is the choice with the most votes regardless
+    # of whether it crosses 50%; MAJORITY is the choice with strictly more
+    # than half the votes (and may return no winner, requiring a runoff
+    # or further deliberation). Earlier revisions of this code conflated
+    # the two; keep them distinct because they pick different winners
+    # whenever no option clears 50%.
     """Methods for reaching council decisions"""
-    MAJORITY = "majority"           # Simple majority wins
+    PLURALITY = "plurality"         # Most votes wins (may be below 50%)
+    MAJORITY = "majority"           # Strictly more than half required
     SUPERMAJORITY = "supermajority" # 2/3 or 3/4 required
     UNANIMOUS = "unanimous"         # All must agree
     RANKED = "ranked"               # Ranked choice voting
@@ -1191,8 +1198,13 @@ class Council:
             )
         return ranked_votes
 
-    def tally_majority(self, votes: dict[str, Vote]) -> VoteResult:
-        """Simple majority tally."""
+    def tally_plurality(self, votes: dict[str, Vote]) -> VoteResult:
+        """Plurality tally: the choice with the most votes wins, even if it
+        falls short of a strict majority. Conflating plurality and strict
+        majority is a common social-choice-theory mistake; they pick
+        different winners whenever no option crosses 50 percent. See
+        tally_majority below for the strict-majority variant.
+        """
         counts = Counter(v.choice for v in votes.values())
         winner, count = counts.most_common(1)[0]
         total = len(votes)
@@ -1204,6 +1216,25 @@ class Council:
             margin=count / total,
             unanimous=(count == total),
             dissents=[cid for cid, v in votes.items() if v.choice != winner]
+        )
+
+    def tally_majority(self, votes: dict[str, Vote]) -> VoteResult | None:
+        """Strict majority tally: return a winner only if some option
+        receives more than half of the votes. Returns None to signal
+        that a runoff or further deliberation is required.
+        """
+        counts = Counter(v.choice for v in votes.values())
+        winner, count = counts.most_common(1)[0]
+        total = len(votes)
+        if count <= total / 2:
+            return None
+        return VoteResult(
+            winner=winner,
+            vote_count=count,
+            total_votes=total,
+            margin=count / total,
+            unanimous=(count == total),
+            dissents=[cid for cid, v in votes.items() if v.choice != winner],
         )
 
     def tally_ranked_choice(self, votes: dict[str, RankedVote]) -> VoteResult:

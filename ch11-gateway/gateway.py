@@ -1375,7 +1375,7 @@ async def main():
     ))
     content_policy.add_rule(ContentRule(
         name="email",
-        pattern=r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b",
+        pattern=r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
         action="redact",
         violation_message="Email address detected"
     ))
