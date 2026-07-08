@@ -961,32 +961,47 @@ class SimpleOrchestrator:
             results = saved_state.get("results", {})
             logger.info(f"Restored checkpoint for task {task_id}")
 
-        # Phase 1: Research (parallel)
-        research_tasks = [
-            self.workers[WorkerType.RESEARCH].execute(
-                Subtask(id="research_1", description=f"Research: {task}",
-                        worker_type=WorkerType.RESEARCH),
-                context
-            ),
-            self.workers[WorkerType.RESEARCH].execute(
-                Subtask(id="research_2", description=f"Research trends: {task}",
-                        worker_type=WorkerType.RESEARCH),
+        # Phase 1: Research (parallel); skip when the restored
+        # checkpoint already contains this phase's results
+        if "research" in results:
+            research_results = results["research"]
+        else:
+            research_tasks = [
+                self.workers[WorkerType.RESEARCH].execute(
+                    Subtask(id="research_1",
+                            description=f"Research: {task}",
+                            worker_type=WorkerType.RESEARCH),
+                    context
+                ),
+                self.workers[WorkerType.RESEARCH].execute(
+                    Subtask(id="research_2",
+                            description=f"Research trends: {task}",
+                            worker_type=WorkerType.RESEARCH),
+                    context
+                )
+            ]
+            research_results = await asyncio.gather(*research_tasks)
+            results["research"] = research_results
+            await self._persistence.save_state(
+                task_id, {"results": results, "phase": "research"}
+            )
+
+        # Phase 2: Analysis; skip when restored from checkpoint
+        if "analysis" in results:
+            analysis_result = results["analysis"]
+        else:
+            analysis_result = await self.workers[
+                WorkerType.ANALYSIS
+            ].execute(
+                Subtask(id="analysis", description=f"Analyze: {task}",
+                        worker_type=WorkerType.ANALYSIS,
+                        input_data={"research": research_results}),
                 context
             )
-        ]
-        research_results = await asyncio.gather(*research_tasks)
-        results["research"] = research_results
-        await self._persistence.save_state(task_id, {"results": results, "phase": "research"})
-
-        # Phase 2: Analysis
-        analysis_result = await self.workers[WorkerType.ANALYSIS].execute(
-            Subtask(id="analysis", description=f"Analyze: {task}",
-                    worker_type=WorkerType.ANALYSIS,
-                    input_data={"research": research_results}),
-            context
-        )
-        results["analysis"] = analysis_result
-        await self._persistence.save_state(task_id, {"results": results, "phase": "analysis"})
+            results["analysis"] = analysis_result
+            await self._persistence.save_state(
+                task_id, {"results": results, "phase": "analysis"}
+            )
 
         # Phase 3: Writing
         writing_result = await self.workers[WorkerType.WRITING].execute(

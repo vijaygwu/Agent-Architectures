@@ -354,7 +354,15 @@ async def fetch_url(url: str, max_length: int = 10000) -> dict:
     async with aiohttp.ClientSession() as session:
         try:
             timeout = aiohttp.ClientTimeout(total=30)
-            async with session.get(url, timeout=timeout) as response:
+            # Do not follow redirects: a redirect to a private or
+            # link-local address would bypass the SSRF guard above
+            async with session.get(
+                url, timeout=timeout, allow_redirects=False
+            ) as response:
+                if 300 <= response.status < 400:
+                    return {"success": False,
+                            "error": "Redirects are not followed",
+                            "url": url}
                 if response.status == 200:
                     # Stream at most max_length bytes instead of
                     # buffering an arbitrarily large body in memory.
@@ -709,6 +717,17 @@ async def run_stdio_server(shutdown_event: asyncio.Event = None):
             metrics.record_request("parse_error", 0, error=True)
             error_response = JsonRpcResponse(
                 error={"code": -32700, "message": "Parse error"}
+            )
+            writer.write((json.dumps(asdict(error_response)) + "\n").encode())
+            await writer.drain()
+        except (TypeError, ValueError) as e:
+            # Valid JSON but malformed JSON-RPC: unexpected or
+            # missing keys raise TypeError from JsonRpcRequest(**data)
+            # and must not kill the serve loop
+            logger.error("Invalid JSON-RPC request", error=str(e))
+            metrics.record_request("invalid_request", 0, error=True)
+            error_response = JsonRpcResponse(
+                error={"code": -32600, "message": "Invalid Request"}
             )
             writer.write((json.dumps(asdict(error_response)) + "\n").encode())
             await writer.drain()

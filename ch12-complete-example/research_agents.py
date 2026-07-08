@@ -876,7 +876,9 @@ class ResearchOrchestrator:
 
         # Create project
         project = ResearchProject(
-            id=f"proj_{int(time.time())}",
+            # uuid suffix: second-resolution timestamps collide when
+            # two research() calls start in the same second
+            id=f"proj_{int(time.time())}_{uuid.uuid4().hex[:8]}",
             query=query
         )
         logger.info(

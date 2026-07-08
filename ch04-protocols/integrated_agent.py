@@ -223,6 +223,9 @@ class IntegratedAgent:
             logger.warning(
                 f"MCP server connection timed out after {connect_timeout}s for '{name}'"
             )
+            # Clean up the orphaned MCP subprocess on the timeout
+            # path; connect_stdio does not clean up on cancellation
+            await client.close()
             raise TimeoutError(
                 f"MCP server connection timed out after {connect_timeout}s"
             )

@@ -590,14 +590,20 @@ class SwarmAgent:
         # Check for danger pheromones
         for task_type in self.capability.task_types:
             location = f"task/{task_type}"
-            danger = [p for p in self.pheromone_trail.sense(location)
-                     if p.type == PheromoneType.DANGER]
+            # sense() runs synchronous embedding calls on a cache
+            # miss; run it in a thread so it cannot block the event
+            # loop for every agent in the swarm
+            nearby = await asyncio.to_thread(
+                self.pheromone_trail.sense, location
+            )
+            danger = [p for p in nearby
+                      if p.type == PheromoneType.DANGER]
             if danger and danger[0].intensity > 0.7:
                 continue  # Avoid this task type temporarily
 
             # Check success pheromones (exploitation)
-            success = [p for p in self.pheromone_trail.sense(location)
-                      if p.type == PheromoneType.VALUE]
+            success = [p for p in nearby
+                       if p.type == PheromoneType.VALUE]
 
             # Decide based on exploration vs exploitation
             if random.random() < self._exploration_rate:
@@ -915,11 +921,17 @@ class HeterogeneousSwarm(Swarm):
             if current < target_count:
                 # Add agents
                 for i in range(target_count - current):
-                    self.add_agent(
+                    agent = self.add_agent(
                         f"{type_name}_{current + i}",
                         self.agent_types[type_name],
                         self._create_handler(self.agent_types[type_name])
                     )
+                    if self._running:
+                        # Schedule the work loop the same way
+                        # Swarm.start() does; otherwise scaled-up
+                        # agents sit idle forever
+                        task = asyncio.create_task(agent.start())
+                        self._agent_tasks.append(task)
             elif current > target_count:
                 # Remove agents (let them terminate naturally)
                 to_remove = [a for a in self.agents.values()
@@ -931,6 +943,9 @@ class HeterogeneousSwarm(Swarm):
                     # Clean up completed stop tasks before adding new ones
                     self._pending_stops = [t for t in self._pending_stops if not t.done()]
                     self._pending_stops.append(asyncio.create_task(agent.stop()))
+                    # Drop from the roster so the next rebalance
+                    # counts only active agents
+                    del self.agents[agent.id]
 
 
     async def cleanup_pending_stops(self):
@@ -1156,14 +1171,14 @@ class PheromoneStrategies:
     def reinforce_path(environment, agent_id: str, path: list[str], success_level: float):
         """Strengthen pheromones along a successful path."""
         for location in path:
-            nearby = environment.pheromones.sense(location, radius=0.1)
+            nearby = environment.sense(location, radius=0.1)
             existing = next((p for p in nearby if p.type == PheromoneType.VALUE), None)
             if existing:
                 # Increase intensity
                 existing.intensity = min(1.0, existing.intensity + success_level * 0.2)
             else:
                 # Create new pheromone
-                environment.pheromones.deposit(Pheromone(
+                environment.deposit(Pheromone(
                     type=PheromoneType.VALUE,
                     location=location,
                     intensity=success_level * 0.5,

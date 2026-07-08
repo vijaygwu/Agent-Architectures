@@ -513,7 +513,7 @@ class CouncilMember:
         name: str,
         expertise: ExpertiseArea,
         persona: str,
-        model: str = "claude-sonnet-4",
+        model: str = "claude-sonnet-4-5",
         mock_mode: bool = False
     ):
         # Input validation
@@ -1291,7 +1291,11 @@ class Council:
             # Count first-choice votes for remaining options
             first_choices = Counter()
             for vote in votes.values():
-                for choice in vote.rankings:
+                # Sort by rank VALUE: dict insertion order is not
+                # guaranteed to match the voter's preference order
+                for choice, _rank in sorted(
+                    vote.rankings.items(), key=lambda kv: kv[1]
+                ):
                     if choice in remaining_options:
                         first_choices[choice] += 1
                         break

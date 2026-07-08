@@ -1655,19 +1655,35 @@ class ResilientGuardianPipeline(GuardianPipeline):
     async def validate(self, action: ActionRequest) -> ValidationResult:
         """Validate with individual guardian failure handling."""
         results = []
+        modified_action = action.parameters.copy()
 
         for guardian in self.guardians:
             if not self.guardian_health[guardian.id]:
                 # Skip unhealthy guardians
                 continue
 
+            # Pass potentially modified parameters to the next
+            # guardian, mirroring GuardianPipeline.validate
+            action_copy = ActionRequest(
+                action_type=action.action_type,
+                parameters=modified_action,
+                agent_id=action.agent_id,
+                context=action.context,
+                timestamp=action.timestamp,
+                request_id=action.request_id
+            )
+
             try:
                 result = await asyncio.wait_for(
-                    guardian.validate(action),
+                    guardian.validate(action_copy),
                     timeout=5.0  # Individual guardian timeout
                 )
                 results.append(result)
-                guardian.log_decision(action, result)
+                guardian.log_decision(action_copy, result)
+
+                if (result.decision == GuardianDecision.MODIFY
+                        and result.modified_action):
+                    modified_action = result.modified_action
 
             except asyncio.TimeoutError:
                 self.mark_unhealthy(guardian.id)
@@ -1681,7 +1697,7 @@ class ResilientGuardianPipeline(GuardianPipeline):
                     f"Guardian {guardian.id} error: {str(e)}"
                 ))
 
-        return self.aggregate_results(results, action)
+        return self.aggregate_results(results, action, modified_action)
 
     async def shutdown(self):
         """Cancel all pending health check tasks on shutdown."""
@@ -1740,8 +1756,10 @@ class ResilientGuardianPipeline(GuardianPipeline):
             confidence=0.0  # Low confidence in fallback
         )
 
-    def aggregate_results(self, results: list[ValidationResult],
-                          action: ActionRequest) -> ValidationResult:
+    def aggregate_results(
+        self, results: list[ValidationResult], action: ActionRequest,
+        modified_action: dict | None = None
+    ) -> ValidationResult:
         """Aggregate results from multiple guardians."""
         if not results:
             return self.create_fallback_result("No guardians available")
@@ -1767,6 +1785,9 @@ class ResilientGuardianPipeline(GuardianPipeline):
         return ValidationResult(
             decision=GuardianDecision.MODIFY if modified else GuardianDecision.APPROVE,
             reason="All guardians approved",
+            # MODIFY must carry the chained parameters, otherwise the
+            # executor silently runs the original, unfixed action
+            modified_action=modified_action if modified else None,
             violations=all_violations
         )
 

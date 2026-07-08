@@ -402,7 +402,15 @@ async def fetch_url(url: str, max_length: int = 10000) -> dict:
         async with aiohttp.ClientSession() as session:
             try:
                 timeout = aiohttp.ClientTimeout(total=30)
-                async with session.get(url, timeout=timeout) as response:
+                # Do not follow redirects: a redirect to a private or
+                # link-local address would bypass the SSRF guard above
+                async with session.get(
+                    url, timeout=timeout, allow_redirects=False
+                ) as response:
+                    if 300 <= response.status < 400:
+                        return {"success": False,
+                                "error": "Redirects are not followed",
+                                "url": url}
                     if response.status == 200:
                         # Stream at most max_length bytes rather than
                         # buffering the whole body in memory.

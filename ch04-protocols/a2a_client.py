@@ -37,7 +37,7 @@ import json
 import logging
 import uuid
 import httpx
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 from dataclasses import dataclass, field, asdict
 from enum import Enum
@@ -333,6 +333,9 @@ class A2AClient:
         self._circuit_breakers: dict[str, CircuitBreaker] = {}
         self._cb_threshold = circuit_breaker_threshold
         self._cb_timeout = circuit_breaker_timeout
+
+        # Cached OAuth tokens per agent: (access_token, expires_at)
+        self._oauth_tokens: dict[str, tuple[str, datetime]] = {}
 
     def _get_circuit_breaker(self, endpoint: str) -> CircuitBreaker:
         """
@@ -753,6 +756,13 @@ class A2AClient:
         if not card.authentication.token_url:
             raise ValueError(f"No token URL for agent: {card.name}")
 
+        # Reuse a cached token until it is within 60s of expiry
+        cached = self._oauth_tokens.get(card.name)
+        if cached and datetime.now(timezone.utc) < (
+            cached[1] - timedelta(seconds=60)
+        ):
+            return cached[0]
+
         try:
             response = await asyncio.wait_for(
                 self._http_client.post(
@@ -769,7 +779,14 @@ class A2AClient:
                 f"HTTP request timed out after 30 seconds obtaining OAuth token for {card.name}"
             ) from e
         response.raise_for_status()
-        return response.json()["access_token"]
+        payload = response.json()
+        token = payload["access_token"]
+        expires_in = float(payload.get("expires_in", 300))
+        self._oauth_tokens[card.name] = (
+            token,
+            datetime.now(timezone.utc) + timedelta(seconds=expires_in),
+        )
+        return token
 
 
 # =============================================================================

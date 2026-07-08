@@ -111,14 +111,6 @@ except ImportError:
                 self._is_open = True
 
 
-# Module-level circuit breaker for connection attempts
-_connection_circuit_breaker = CircuitBreaker(
-    name="mcp_connection",
-    failure_threshold=3,
-    recovery_timeout=30.0
-)
-
-
 def calculate_backoff_with_jitter(
     attempt: int,
     base_delay: float = 1.0,
@@ -173,8 +165,18 @@ class MCPClient:
         self.writer = None
         self.process = None
         self.tools: dict[str, MCPTool] = {}
+        # Per-instance circuit breaker: connection failures against
+        # one server must not block connections to healthy servers
+        self._circuit_breaker = CircuitBreaker(
+            name="mcp_connection",
+            failure_threshold=3,
+            recovery_timeout=30.0
+        )
         self._max_tools = max_tools
         self.timeout = timeout
+        # Serializes the write-request/read-response cycle on the
+        # shared stdio pipes (see _send_request)
+        self._request_lock = asyncio.Lock()
 
     async def connect_stdio(self, command: list[str],
                             max_retries: int = 3, base_delay: float = 1.0,
@@ -192,10 +194,10 @@ class MCPClient:
             CircuitBreakerOpen: If circuit breaker is open due to repeated failures.
         """
         # Check circuit breaker before attempting connection
-        if not _connection_circuit_breaker.allow():
+        if not self._circuit_breaker.allow():
             raise CircuitBreakerOpen(
-                _connection_circuit_breaker.name,
-                _connection_circuit_breaker.recovery_timeout,
+                self._circuit_breaker.name,
+                self._circuit_breaker.recovery_timeout,
             )
 
         logger.info("Attempting MCP server connection",
@@ -213,7 +215,9 @@ class MCPClient:
                     *command,
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
+                    # DEVNULL: stderr is never read here, and a chatty
+                    # server would fill the OS pipe buffer and deadlock
+                    stderr=asyncio.subprocess.DEVNULL
                 )
                 self.reader = self.process.stdout
                 self.writer = self.process.stdin
@@ -225,7 +229,7 @@ class MCPClient:
                 await self._load_tools()
 
                 # Record success in circuit breaker
-                _connection_circuit_breaker.record_success()
+                self._circuit_breaker.record_success()
                 logger.info("MCP server connection established",
                            tools_loaded=len(self.tools))
                 return  # Success
@@ -257,7 +261,7 @@ class MCPClient:
                     await asyncio.sleep(delay)
 
         # Record failure in circuit breaker
-        _connection_circuit_breaker.record_failure()
+        self._circuit_breaker.record_failure()
         logger.error("MCP server connection failed after all retries",
                     max_retries=max_retries,
                     error=str(last_error))
@@ -267,7 +271,20 @@ class MCPClient:
         )
 
     async def _send_request(self, method: str, params: dict = None) -> dict:
-        """Send a JSON-RPC request and wait for response."""
+        """Send a JSON-RPC request and wait for response.
+
+        A lock serializes the write/read cycle: without it, two
+        concurrent call_tool() invocations interleave on the shared
+        stdin/stdout, and each may read (and discard) the other's
+        response, causing spurious timeouts.
+        """
+        async with self._request_lock:
+            return await self._send_request_unlocked(method, params)
+
+    async def _send_request_unlocked(
+        self, method: str, params: dict = None
+    ) -> dict:
+        """Send a request without the lock (caller must hold it)."""
         self.request_id += 1
         request = {
             "jsonrpc": "2.0",
