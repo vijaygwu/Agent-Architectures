@@ -22,7 +22,7 @@ All code has been reviewed for:
 - **Type safety**: Protocols, TypedDicts, Final constants, complete type hints
 - **Input validation**: Bounds checking on all public methods
 
-**Evaluation Score: 4.79/5** across 7 review dimensions (code quality, technical accuracy, pedagogy, systems practices, academic rigor, skeptical review, copy structure)
+**Latest evaluation (July 2026):** the book + companion code passed an 8-reviewer evaluation gauntlet (v6.6) with independent adversarial fix verification — zero Critical and zero corroborated Major findings, PUBLICATION_READY. Every fix in this repository is validated against the printed book text before merging.
 
 ## Book Overview
 
@@ -156,7 +156,21 @@ This code is provided for educational purposes to accompany the book. See LICENS
 
 ## Recent Updates
 
-**May 2026 (Latest) - Production-Ready Release**
+**July 2026 (Latest) - Evaluation Gauntlet v6.6 Fixes**
+
+65 fixes from a rebuilt, stricter review harness (8 parallel reviewers, findings ledger, adversarial 3-lens fix verification). Two critical bugs, both in `ch04-protocols/mcp_client.py`:
+- `connect_stdio` called a nonexistent `CircuitBreaker.check()` method — every connection attempt raised `AttributeError` when the `common` package imported successfully
+- the ImportError fallback passed structured-logging kwargs to a stdlib `logging.Logger`, raising `TypeError` — so the client failed in *both* import configurations
+
+Majors resolved across ch04-ch12 and `common/`:
+- Bounded previously unbounded task registries, per-operation latency lists, and history collections (eviction with backpressure, `deque(maxlen=...)`, streaming histograms)
+- Session-guard checks on all A2A request methods (clear `RuntimeError` instead of `AttributeError` outside `async with`)
+- Server handlers catch specific exception types; internal errors return generic 500s instead of leaking exception strings in 400 responses
+- Timeouts and retry-with-backoff on remaining unguarded external calls; hardcoded limits made configurable
+
+Every fix was applied through a checkpointed pipeline (verbatim-unique diff validation, `py_compile`, automatic rollback) and survived a three-lens adversarial verification panel (numeric consistency, structural integrity, meaning preservation) — one generated fix was vetoed by the panel and reverted rather than shipped.
+
+**May 2026 - Production-Ready Release**
 
 New common modules for production patterns:
 - `common/resilience.py`: CircuitBreaker, RateLimiter, RetryWithBackoff with Generic types
