@@ -585,8 +585,10 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
             })
         )]
 
-    # Check rate limit before processing tool calls
-    if not _tool_rate_limiter.allow():
+    # Check rate limit before processing tool calls. The distributed
+    # limiter performs a synchronous Redis round trip, so run it in
+    # a worker thread to avoid blocking the event loop.
+    if not await asyncio.to_thread(_tool_rate_limiter.allow):
         logger.warning(f"Rate limit exceeded for tool call: {name}")
         return [TextContent(
             type="text",

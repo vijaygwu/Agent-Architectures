@@ -16,12 +16,15 @@ Production Notes:
 """
 
 import asyncio
+import ipaddress
 import json
 import logging
 import os
 import signal
+import socket
 import sys
 import time
+import urllib.parse
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass, asdict, field
@@ -245,6 +248,11 @@ class TokenAuthenticator:
     def __init__(self):
         self.enabled = os.environ.get("MCP_AUTH_DISABLED", "").lower() != "true"
         self.valid_token = os.environ.get("MCP_API_TOKEN", "")
+        if self.enabled and not self.valid_token:
+            logging.getLogger("mcp-server-book").warning(
+                "Authentication enabled but MCP_API_TOKEN is not "
+                "set; all requests will be allowed"
+            )
 
     def authenticate(self, token: str | None) -> bool:
         """Check if the provided token is valid.
@@ -321,18 +329,48 @@ async def web_search(query: str, num_results: int = 5) -> dict:
                 return {"success": False, "error": f"HTTP {response.status}"}
 
 async def fetch_url(url: str, max_length: int = 10000) -> dict:
-    """Fetch content from a URL."""
+    """Fetch content from a URL (http/https only, streamed reads)."""
+    # SSRF guard: allow only http(s) URLs on public addresses.
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return {"success": False,
+                "error": f"Unsupported URL scheme: {parsed.scheme}",
+                "url": url}
+    try:
+        infos = await asyncio.get_running_loop().getaddrinfo(
+            parsed.hostname, None
+        )
+    except (socket.gaierror, TypeError) as e:
+        return {"success": False,
+                "error": f"Could not resolve host: {e}", "url": url}
+    for info in infos:
+        addr = ipaddress.ip_address(info[4][0])
+        if (addr.is_private or addr.is_loopback
+                or addr.is_link_local or addr.is_reserved):
+            return {"success": False,
+                    "error": "URL resolves to a private address",
+                    "url": url}
+
     async with aiohttp.ClientSession() as session:
         try:
             timeout = aiohttp.ClientTimeout(total=30)
             async with session.get(url, timeout=timeout) as response:
                 if response.status == 200:
-                    content = await response.text()
+                    # Stream at most max_length bytes instead of
+                    # buffering an arbitrarily large body in memory.
+                    raw = await response.content.read(max_length + 1)
+                    try:
+                        content = raw.decode(
+                            response.charset or "utf-8",
+                            errors="replace"
+                        )
+                    except LookupError:
+                        content = raw.decode("utf-8", errors="replace")
                     return {
                         "success": True,
                         "url": url,
                         "content": content[:max_length],
-                        "truncated": len(content) > max_length,
+                        "truncated": len(raw) > max_length,
                         "content_type": response.headers.get(
                             "Content-Type", "unknown")
                     }
@@ -419,7 +457,16 @@ class MCPServer:
             elif method == "tools/list":
                 return self._handle_tools_list(request.id)
             elif method == "tools/call":
-                return await self._handle_tools_call(request.id, params)
+                # Pass the auth token through so TokenAuthenticator
+                # actually sees it (carried in params._meta, with a
+                # top-level auth_token field accepted as well).
+                meta = params.get("_meta") or {}
+                auth_token = meta.get("auth_token") or params.get(
+                    "auth_token"
+                )
+                return await self._handle_tools_call(
+                    request.id, params, auth_token=auth_token
+                )
             elif method == "resources/list":
                 return self._handle_resources_list(request.id)
             elif method == "metrics":
@@ -550,11 +597,49 @@ class MCPServer:
                 error={"code": -32602, "message": f"Unknown tool: {tool_name}"}
             )
 
+        # Validate arguments against the tool's declared inputSchema
+        # before dispatch: unknown keys are rejected instead of being
+        # forwarded as arbitrary kwargs into the handler.
+        schema = self.tools[tool_name].inputSchema
+        allowed_args = set(schema.get("properties", {}))
+        unknown_args = set(arguments) - allowed_args
+        missing_args = set(schema.get("required", [])) - set(arguments)
+        if unknown_args or missing_args:
+            return JsonRpcResponse(
+                id=req_id,
+                error={
+                    "code": -32602,
+                    "message": (
+                        f"Invalid arguments for {tool_name}: "
+                        f"unknown={sorted(unknown_args)}, "
+                        f"missing={sorted(missing_args)}"
+                    )
+                }
+            )
+
         metrics.record_tool_call(tool_name)
         tool_start = time.time()
 
         handler = self.tool_handlers[tool_name]
-        result = await handler(**arguments)
+        try:
+            result = await handler(**arguments)
+        except Exception as e:
+            logger.error(
+                "Tool execution failed",
+                request_id=self.request_id,
+                tool=tool_name,
+                error=str(e),
+                error_type=type(e).__name__
+            )
+            return JsonRpcResponse(
+                id=req_id,
+                error={
+                    "code": -32603,
+                    "message": (
+                        f"Tool execution failed: {type(e).__name__}"
+                    )
+                }
+            )
 
         tool_latency = time.time() - tool_start
         logger.info(

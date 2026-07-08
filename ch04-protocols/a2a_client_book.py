@@ -21,7 +21,7 @@ import os
 import sys
 import time
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from typing import Any
@@ -164,10 +164,16 @@ class ClientMetrics:
     - latency_by_operation: Latency stats per operation type
     """
 
+    # Bound per-operation samples so a long-lived client does not
+    # grow memory with total request count.
+    MAX_SAMPLES_PER_OPERATION = 1000
+
     def __init__(self):
         self.request_count = 0
         self.error_count = 0
-        self.latency_by_operation: dict[str, list[float]] = defaultdict(list)
+        self.latency_by_operation: dict[str, deque] = defaultdict(
+            lambda: deque(maxlen=self.MAX_SAMPLES_PER_OPERATION)
+        )
         self._start_time = time.time()
 
     def record_request(self, operation: str, latency: float, error: bool = False):
@@ -206,20 +212,6 @@ client_metrics = ClientMetrics()
 
 # Default timeout for HTTP operations (configurable via environment)
 DEFAULT_TIMEOUT = float(os.environ.get("A2A_CLIENT_TIMEOUT", "30.0"))
-
-# Simple retry helper for HTTP operations
-async def _retry_http(coro_func, max_attempts=3, base_delay=1.0):
-    """Retry HTTP operation with exponential backoff."""
-    last_error = None
-    for attempt in range(max_attempts):
-        try:
-            return await coro_func()
-        except (aiohttp.ClientError, TimeoutError) as e:
-            last_error = e
-            if attempt < max_attempts - 1:
-                await asyncio.sleep(base_delay * (2 ** attempt))
-    raise last_error
-
 
 class A2AError(Exception):
     """Exception raised for A2A protocol errors."""
@@ -462,6 +454,9 @@ class A2AClient:
     async def send_task(self, agent_url: str, skill: str, input_data: dict,
                         metadata: dict = None, timeout: float | None = None) -> Task:
         """Send a task to an agent with logging and metrics."""
+        if not self.session:
+            raise RuntimeError("Client not initialized. Use 'async with A2AClient()' context manager.")
+
         request_id = self._new_request_id()
         start_time = time.time()
         effective_timeout = timeout or self.timeout or DEFAULT_TIMEOUT
@@ -542,6 +537,9 @@ class A2AClient:
 
     async def get_task_status(self, agent_url: str, task_id: str, timeout: float | None = None) -> Task:
         """Get the status of a task with logging and metrics."""
+        if not self.session:
+            raise RuntimeError("Client not initialized. Use 'async with A2AClient()' context manager.")
+
         start_time = time.time()
         endpoint = f"{agent_url.rstrip('/')}/tasks/{task_id}"
         effective_timeout = timeout or self.timeout or DEFAULT_TIMEOUT
@@ -605,6 +603,9 @@ class A2AClient:
     async def get_task_artifacts(self, agent_url: str,
                                   task_id: str, timeout: float | None = None) -> list[Artifact]:
         """Get artifacts produced by a task."""
+        if not self.session:
+            raise RuntimeError("Client not initialized. Use 'async with A2AClient()' context manager.")
+
         endpoint = f"{agent_url.rstrip('/')}/tasks/{task_id}/artifacts"
         effective_timeout = timeout or self.timeout or DEFAULT_TIMEOUT
         request_timeout = aiohttp.ClientTimeout(total=effective_timeout)
@@ -688,6 +689,16 @@ class A2AServer:
         self.tasks: dict[str, Task] = {}
         self.artifacts: dict[str, list[Artifact]] = {}
         self._max_tasks = max_tasks
+        self._background_tasks: set = set()
+
+    def _on_background_task_done(self, task) -> None:
+        """Observe a finished background task and log failures."""
+        self._background_tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            logger.error(
+                "Background task processing failed",
+                error=str(task.exception())
+            )
 
     async def handle_agent_card(self, request) -> dict:
         """Handle GET /.well-known/agent.json"""
@@ -725,8 +736,12 @@ class A2AServer:
                 self.artifacts.pop(tid, None)
         self.artifacts[task.id] = []
 
-        # Start processing asynchronously
-        asyncio.create_task(self._process_task(task))
+        # Start processing asynchronously. Keep a strong reference so
+        # the task cannot be garbage-collected mid-flight, and log
+        # any exception that escapes _process_task.
+        bg_task = asyncio.create_task(self._process_task(task))
+        self._background_tasks.add(bg_task)
+        bg_task.add_done_callback(self._on_background_task_done)
 
         return task.to_dict()
 

@@ -113,7 +113,10 @@ except ImportError:
 try:
     from sentence_transformers import SentenceTransformer
     SENTENCE_TRANSFORMERS_AVAILABLE = True
-    _embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+    # Model is lazy-loaded on first get_embedding() call: loading it
+    # here would pull hundreds of MB (and possibly a download) as an
+    # import side effect for anyone importing swarm.py.
+    _embedding_model = None
 except ImportError:
     SENTENCE_TRANSFORMERS_AVAILABLE = False
     _embedding_model = None
@@ -156,7 +159,11 @@ def get_embedding(text: str) -> list[float]:
     global _fallback_warning_shown
 
     # Option B (default): Sentence-transformers (local, no API key)
-    if SENTENCE_TRANSFORMERS_AVAILABLE and _embedding_model is not None:
+    if SENTENCE_TRANSFORMERS_AVAILABLE:
+        global _embedding_model
+        if _embedding_model is None:
+            # Lazy-load on first use (see import section above)
+            _embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
         return _embedding_model.encode(text).tolist()
 
     # Option A: OpenAI embeddings (requires API key)
@@ -198,6 +205,20 @@ def get_embedding(text: str) -> list[float]:
     return [random.random() for _ in range(384)]
 
 
+from functools import lru_cache
+
+
+@lru_cache(maxsize=4096)
+def _cached_embedding(text: str) -> tuple:
+    """LRU-cached embedding keyed on the location string.
+
+    PheromoneField.sense() computes distances against every stored
+    pheromone on each agent work-cycle; caching avoids re-embedding
+    the same location strings inside that hot loop.
+    """
+    return tuple(get_embedding(text))
+
+
 async def get_embedding_async(text: str) -> list[float]:
     """
     Async version of get_embedding for use with OpenAI's async client.
@@ -211,8 +232,8 @@ async def get_embedding_async(text: str) -> list[float]:
         Embedding vector
     """
     # For sentence-transformers, just use the sync version (it's local and fast)
-    if SENTENCE_TRANSFORMERS_AVAILABLE and _embedding_model is not None:
-        return _embedding_model.encode(text).tolist()
+    if SENTENCE_TRANSFORMERS_AVAILABLE:
+        return get_embedding(text)
 
     # For OpenAI, use async client if available
     if OPENAI_AVAILABLE:
@@ -333,8 +354,8 @@ class PheromoneField:
 
     def distance(self, loc1: str, loc2: str) -> float:
         """Semantic distance between locations (embedding-based)."""
-        emb1 = get_embedding(loc1)
-        emb2 = get_embedding(loc2)
+        emb1 = _cached_embedding(loc1)
+        emb2 = _cached_embedding(loc2)
         return 1 - cosine_similarity(emb1, emb2)
 
     def prune(self, threshold: float = 0.01):
@@ -388,6 +409,7 @@ class SwarmTask:
     attempts: int = 0
     max_attempts: int = 3
     created_at: float = field(default_factory=time.time)
+    claimed_at: Optional[float] = None
 
     def to_location(self) -> str:
         """Convert task to a location identifier for pheromone trails."""
@@ -400,11 +422,13 @@ class TaskPool:
     Implements task stealing and load balancing.
     """
 
-    def __init__(self, max_completed: int = 10000):
+    def __init__(self, max_completed: int = 10000,
+                 claim_lease_seconds: float = 60.0):
         if max_completed <= 0:
             raise ValueError("Max completed tasks must be greater than 0")
         self.tasks: dict[str, SwarmTask] = {}
         self.completed: deque[SwarmTask] = deque(maxlen=max_completed)
+        self.claim_lease_seconds = claim_lease_seconds
         self._lock = asyncio.Lock()
 
     def get_backpressure_info(self) -> BackpressureInfo:
@@ -444,12 +468,23 @@ class TaskPool:
                          task_types: Optional[list[str]] = None) -> Optional[SwarmTask]:
         """Attempt to claim an available task."""
         async with self._lock:
+            # Release stale claims first: if a claiming agent crashed
+            # or was removed, its lease expires and the task returns
+            # to the pending pool instead of being lost forever.
+            now = time.time()
+            for t in self.tasks.values():
+                if (t.status == "claimed" and t.claimed_at is not None
+                        and now - t.claimed_at > self.claim_lease_seconds):
+                    t.status = "pending"
+                    t.assigned_agent = None
+                    t.claimed_at = None
             for task in sorted(self.tasks.values(),
                              key=lambda t: t.priority, reverse=True):
                 if task.status == "pending":
                     if task_types is None or task.type in task_types:
                         task.status = "claimed"
                         task.assigned_agent = agent_id
+                        task.claimed_at = now
                         return task
             return None
 

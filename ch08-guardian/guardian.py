@@ -427,10 +427,13 @@ class GuardianPipeline:
 class GuardedExecutor:
     """Executes actions only after guardian approval."""
 
-    def __init__(self, pipeline: GuardianPipeline, executor: Callable):
+    def __init__(self, pipeline: GuardianPipeline, executor: Callable,
+                 max_log_entries: int = 10000):
         self.pipeline = pipeline
         self.executor = executor
-        self.execution_log: list[dict] = []
+        # Bounded like Guardian.audit_log so the hottest path does
+        # not leak memory in long-running processes.
+        self.execution_log: deque = deque(maxlen=max_log_entries)
 
     async def execute(self, action: ActionRequest) -> dict:
         """Validate and execute an action."""
@@ -1174,7 +1177,7 @@ class SecurityGuardian(Guardian):
             (r";\s*DROP\s+TABLE", "SQL injection attempt"),
             (r"<script[^>]*>", "XSS attempt"),
             (r"\$\{.*\}", "Template injection attempt"),
-            (r"__import__|eval|exec", "Code injection attempt"),
+            (r"\b(__import__|eval|exec)\s*\(", "Code injection attempt"),
             (r"\.\./\.\./", "Path traversal attempt"),
         ]
 
@@ -1819,9 +1822,11 @@ class EscalationTicket:
 class EscalationManager:
     """Manages escalated actions requiring human review."""
 
-    def __init__(self, notification_service, timeout_hours: int = 24):
+    def __init__(self, notification_service, timeout_hours: int = 24,
+                 max_tickets: int = 10000):
         if timeout_hours <= 0:
             raise ValueError("Timeout hours must be positive")
+        self.max_tickets = max_tickets
         self.tickets: dict[str, EscalationTicket] = {}
         self.notification_service = notification_service
         self.timeout_hours = timeout_hours
@@ -1840,6 +1845,16 @@ class EscalationManager:
             created_at=datetime.now(timezone.utc)
         )
 
+        # Prune resolved/expired tickets past the retention cap so a
+        # long-running manager does not leak memory.
+        if len(self.tickets) >= self.max_tickets:
+            terminal = [
+                tid for tid, t in self.tickets.items()
+                if t.status in ("approved", "denied", "expired")
+            ]
+            for tid in terminal[:100]:
+                del self.tickets[tid]
+                self.pending_actions.pop(tid, None)
         self.tickets[ticket.ticket_id] = ticket
 
         # Notify reviewers

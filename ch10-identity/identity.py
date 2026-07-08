@@ -51,6 +51,7 @@ import asyncio
 import hashlib
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -386,20 +387,31 @@ class AsymmetricJWTAuth:
             self.private_key = serialization.load_pem_private_key(
                 private_key_pem, password=None
             )
+            self.public_key = self.private_key.public_key()
+        elif public_key_pem:
+            # Verify-only instance: load the supplied public key and
+            # keep no private key, so externally issued tokens are
+            # verified against the correct keypair.
+            self.private_key = None
+            self.public_key = serialization.load_pem_public_key(
+                public_key_pem
+            )
         else:
             # Generate new key pair (3072 bits per NIST SP 800-57)
             self.private_key = rsa.generate_private_key(
                 public_exponent=65537,
                 key_size=3072
             )
-
-        self.public_key = self.private_key.public_key() if self.private_key else (
-            serialization.load_pem_public_key(public_key_pem)
-        )
+            self.public_key = self.private_key.public_key()
 
     def create_token(self, agent_id: str, scopes: list[str],
                       ttl_hours: int = 24) -> str:
         """Create a JWT signed with private key."""
+        if self.private_key is None:
+            raise ValueError(
+                "This instance is verify-only (constructed with a "
+                "public key); it cannot create tokens"
+            )
         now = datetime.now(timezone.utc)
         payload = {
             "sub": agent_id,
@@ -923,9 +935,18 @@ class AuditEntry:
         }
 
 class AuditLog:
+    # In-memory cap; durable retention requires a storage backend.
+    MAX_IN_MEMORY_ENTRIES = 10000
+
     def __init__(self, storage: Storage | None = None):
-        self.entries: list[AuditEntry] = []
+        self.entries: deque = deque(maxlen=self.MAX_IN_MEMORY_ENTRIES)
         self.storage = storage
+        if storage is None:
+            logger.warning(
+                "AuditLog has no durable storage backend; only the "
+                f"most recent {self.MAX_IN_MEMORY_ENTRIES} entries "
+                "are kept in memory"
+            )
 
     def log(self, agent_id: str, action: str, resource: str,
             outcome: str, details: dict = None):
@@ -949,7 +970,7 @@ class AuditLog:
               start_time: datetime = None,
               end_time: datetime = None) -> list[AuditEntry]:
         """Query audit log."""
-        results = self.entries
+        results = list(self.entries)
 
         if agent_id:
             results = [e for e in results if e.agent_id == agent_id]

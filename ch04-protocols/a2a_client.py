@@ -545,6 +545,22 @@ class A2AClient:
                         if t.state in (TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELLED)]
             for tid in completed[:100]:  # Remove up to 100 completed tasks
                 del self._active_tasks[tid]
+            if len(self._active_tasks) >= self._max_active_tasks:
+                # No terminal tasks to evict: drop the oldest tracked
+                # tasks so the dict never grows past the cap.
+                overflow = (
+                    len(self._active_tasks) - self._max_active_tasks + 1
+                )
+                oldest = sorted(
+                    self._active_tasks,
+                    key=lambda tid: self._active_tasks[tid].created_at
+                )[:overflow]
+                for tid in oldest:
+                    del self._active_tasks[tid]
+                logger.warning(
+                    f"Active task cap reached; evicted {len(oldest)} "
+                    f"oldest non-terminal tasks from local tracking"
+                )
         self._active_tasks[task_id] = task
         return task
 
@@ -792,8 +808,16 @@ def create_a2a_server(
         try:
             task = await handler.handle_task(task_data)
             return JSONResponse(content=task.to_dict())
-        except Exception as e:
+        except (ValueError, KeyError) as e:
+            # Malformed or invalid request payload
             raise HTTPException(status_code=400, detail=str(e))
+        except Exception:
+            # Genuine server fault: log details server-side and
+            # return a generic 500 so internals do not leak.
+            logger.exception("Unhandled error while creating task")
+            raise HTTPException(
+                status_code=500, detail="Internal server error"
+            )
 
     @app.get("/tasks/{task_id}")
     async def get_task(task_id: str):
@@ -831,8 +855,26 @@ class A2ATaskHandler:
     Subclass this to implement your agent's task handling logic.
     """
 
+    # Cap stored tasks to prevent unbounded memory growth.
+    MAX_STORED_TASKS = 10000
+
     def __init__(self):
         self.tasks: dict[str, A2ATask] = {}
+
+    def store_task(self, task: "A2ATask") -> None:
+        """Store a task, evicting terminal-state tasks past the cap."""
+        if len(self.tasks) >= self.MAX_STORED_TASKS:
+            terminal = [
+                tid for tid, t in self.tasks.items()
+                if t.state in (TaskState.COMPLETED, TaskState.FAILED,
+                               TaskState.CANCELLED)
+            ]
+            for tid in terminal[:100]:
+                del self.tasks[tid]
+            while len(self.tasks) >= self.MAX_STORED_TASKS:
+                # Last resort: drop the oldest stored task
+                del self.tasks[next(iter(self.tasks))]
+        self.tasks[task.id] = task
 
     async def handle_task(self, task_data: dict) -> A2ATask:
         """Handle incoming task - override in subclass"""
@@ -914,7 +956,7 @@ class InventoryAgentHandler(A2ATaskHandler):
         else:
             task.state = TaskState.FAILED
             task.error = f"Unknown capability: {capability}"
-            self.tasks[task_id] = task
+            self.store_task(task)
             return task
 
         # Add response message
@@ -928,7 +970,7 @@ class InventoryAgentHandler(A2ATaskHandler):
         task.state = TaskState.COMPLETED
         task.result = result
 
-        self.tasks[task_id] = task
+        self.store_task(task)
         return task
 
     async def _check_stock(self, request: str) -> dict:

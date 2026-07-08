@@ -30,17 +30,26 @@ except ImportError:
 
     class CircuitBreaker:
         def __init__(self, **kwargs):
+            import time as _time
+            self._time = _time
             self._failures = 0
             self._threshold = kwargs.get('failure_threshold', 5)
+            self._recovery_timeout = kwargs.get('recovery_timeout', 30.0)
+            self._last_failure_time = 0.0
 
         def allow(self):
-            return self._failures < self._threshold
+            if self._failures < self._threshold:
+                return True
+            # Half-open: allow a test call after the recovery timeout
+            elapsed = self._time.time() - self._last_failure_time
+            return elapsed >= self._recovery_timeout
 
         def record_success(self):
             self._failures = 0
 
         def record_failure(self):
             self._failures += 1
+            self._last_failure_time = self._time.time()
 
 
 # Module-level circuit breaker for LLM/tool calls
@@ -271,7 +280,7 @@ class IntegratedAgent:
 
         # Check circuit breaker before making the call
         if not _llm_circuit_breaker.allow():
-            raise CircuitBreakerOpen("LLM circuit breaker open - too many failures")
+            raise CircuitBreakerOpen("integrated_agent_llm", 60.0)
 
         call_timeout = timeout if timeout is not None else LLM_CALL_TIMEOUT
         try:
@@ -326,9 +335,13 @@ class IntegratedAgent:
             RuntimeError: If the task fails after all retries.
             asyncio.TimeoutError: If the task times out after all retries.
         """
-        async def _execute_delegation():
-            """Inner function for retry wrapper."""
-            task = await self.a2a_client.send_task(agent_url, skill, input_data)
+        # Submit the task exactly once: re-sending on retry would
+        # create a new task (and duplicate side effects) on the
+        # target agent for non-idempotent skills.
+        task = await self.a2a_client.send_task(agent_url, skill, input_data)
+
+        async def _await_completion():
+            """Inner function for retry wrapper (polling only)."""
             completed = await asyncio.wait_for(
                 self.a2a_client.wait_for_completion(agent_url, task.id),
                 timeout=timeout or DELEGATE_TIMEOUT
@@ -338,22 +351,23 @@ class IntegratedAgent:
                 artifacts = await self.a2a_client.get_task_artifacts(agent_url, task.id)
                 return artifacts[0].content if artifacts else None
             else:
-                # Task failed - this may be retryable if it's a transient error
+                # Task failed on the target agent. Not retryable:
+                # resubmission could duplicate side effects.
                 error_msg = completed.metadata.get('error', 'Unknown error')
                 raise RuntimeError(f"Task failed: {error_msg}")
 
-        # Use retry with exponential backoff for resilience
+        # Retry only the polling/wait step for the SAME task id.
         # Retryable exceptions:
         # - asyncio.TimeoutError: Network/service temporarily slow
         # - ConnectionError: Network connectivity issues
-        # - RuntimeError: Task failures that may be transient
+        # RuntimeError (task failure) is deliberately NOT retried.
         return await retry_with_exponential_backoff(
-            _execute_delegation,
+            _await_completion,
             max_retries=max_retries,
             base_delay=retry_delay,
             max_delay=30.0,
             exponential_base=2.0,
-            retryable_exceptions=(asyncio.TimeoutError, ConnectionError, RuntimeError)
+            retryable_exceptions=(asyncio.TimeoutError, ConnectionError)
         )
 
     def get_all_tools(self) -> list[dict]:

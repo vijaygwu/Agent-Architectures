@@ -203,6 +203,10 @@ except ImportError:
                 return True
             return False
 
+        async def acquire(self, tokens: float = 1.0) -> bool:
+            """Async acquire matching common.resilience.RateLimiter."""
+            return self.allow(tokens)
+
         def get_wait_time(self, tokens: float = 1.0) -> float:
             """Calculate time until tokens available."""
             self._refill()
@@ -591,8 +595,10 @@ class CouncilMember:
             CircuitBreakerOpen: If circuit breaker is open (fail fast)
             TimeoutError: If the API call times out
         """
-        # Check rate limiter first (shared across all council members)
-        if not _llm_rate_limiter.allow():
+        # Check rate limiter first (shared across all council members).
+        # acquire() is the async API shared by common.resilience and
+        # the inline fallback above.
+        if not await _llm_rate_limiter.acquire():
             wait_time = _llm_rate_limiter.get_wait_time()
             logger.warning(
                 f"LLM rate limit exceeded in {operation_name}",
@@ -1026,7 +1032,24 @@ class Council:
             member.propose(question, context, previous_proposals)
             for member in self.members
         ]
-        proposals = await asyncio.gather(*proposal_tasks)
+        # One failing member must not abort the whole round: gather
+        # exceptions and proceed with the members that responded.
+        proposal_results = await asyncio.gather(
+            *proposal_tasks, return_exceptions=True
+        )
+        proposals = []
+        for member, result in zip(self.members, proposal_results):
+            if isinstance(result, Exception):
+                logger.warning(
+                    f"Proposal failed for member "
+                    f"{member.member_id}: {result}"
+                )
+            else:
+                proposals.append(result)
+        if not proposals:
+            raise RuntimeError(
+                "All council members failed to produce proposals"
+            )
 
         # Phase 2: Cross-critique (parallel)
         critique_tasks = []
@@ -1037,7 +1060,18 @@ class Council:
                     member.critique(proposal, question, context)
                 )
 
-        critiques = await asyncio.gather(*critique_tasks)
+        critique_results = await asyncio.gather(
+            *critique_tasks, return_exceptions=True
+        )
+        critiques = [
+            c for c in critique_results if not isinstance(c, Exception)
+        ]
+        failed_critiques = len(critique_results) - len(critiques)
+        if failed_critiques:
+            logger.warning(
+                f"{failed_critiques} critique call(s) failed; "
+                f"continuing with {len(critiques)} critiques"
+            )
 
         # Determine round outcome
         outcome = self._assess_round_outcome(proposals, critiques)
@@ -1103,7 +1137,18 @@ class Council:
                 if member.member_id != proposal.member_id  # Don't vote on own proposal
             ]
 
-            votes = await asyncio.gather(*vote_tasks)
+            vote_results = await asyncio.gather(
+                *vote_tasks, return_exceptions=True
+            )
+            votes = [
+                v for v in vote_results if not isinstance(v, Exception)
+            ]
+            failed_votes = len(vote_results) - len(votes)
+            if failed_votes:
+                logger.warning(
+                    f"{failed_votes} vote call(s) failed for proposal "
+                    f"{proposal.id}; counting {len(votes)} votes"
+                )
             all_votes.extend(votes)
 
         # Tally votes

@@ -29,7 +29,34 @@ try:
     logger = StructuredLogger("mcp_client")
 except ImportError:
     import logging
-    logger = logging.getLogger("mcp_client")
+
+    class _KwargsLoggerShim:
+        """Adapts stdlib logging to the StructuredLogger kwargs API."""
+
+        def __init__(self, name: str):
+            self._logger = logging.getLogger(name)
+
+        def _format(self, message: str, kwargs: dict) -> str:
+            if kwargs:
+                context = " ".join(
+                    f"{key}={value}" for key, value in kwargs.items()
+                )
+                return f"{message} | {context}"
+            return message
+
+        def debug(self, message: str, **kwargs):
+            self._logger.debug(self._format(message, kwargs))
+
+        def info(self, message: str, **kwargs):
+            self._logger.info(self._format(message, kwargs))
+
+        def warning(self, message: str, **kwargs):
+            self._logger.warning(self._format(message, kwargs))
+
+        def error(self, message: str, **kwargs):
+            self._logger.error(self._format(message, kwargs))
+
+    logger = _KwargsLoggerShim("mcp_client")
 
 # Circuit breaker for connection resilience
 try:
@@ -57,17 +84,19 @@ except ImportError:
             self._last_failure_time = 0.0
             self._is_open = False
 
-        def check(self) -> None:
-            """Check if circuit allows request. Raises CircuitBreakerOpen if not."""
+        def allow(self) -> bool:
+            """Return True if the circuit allows a request.
+
+            Matches the public API of common.resilience.CircuitBreaker.
+            """
             if self._is_open:
                 elapsed = time.time() - self._last_failure_time
                 if elapsed < self.recovery_timeout:
-                    raise CircuitBreakerOpen(
-                        self.name, self.recovery_timeout - elapsed
-                    )
+                    return False
                 # Recovery timeout passed, allow test request
                 self._is_open = False
                 self._failure_count = 0
+            return True
 
         def record_success(self) -> None:
             """Record a successful call."""
@@ -163,7 +192,11 @@ class MCPClient:
             CircuitBreakerOpen: If circuit breaker is open due to repeated failures.
         """
         # Check circuit breaker before attempting connection
-        _connection_circuit_breaker.check()
+        if not _connection_circuit_breaker.allow():
+            raise CircuitBreakerOpen(
+                _connection_circuit_breaker.name,
+                _connection_circuit_breaker.recovery_timeout,
+            )
 
         logger.info("Attempting MCP server connection",
                     command=command[0] if command else "unknown",
@@ -246,13 +279,29 @@ class MCPClient:
         self.writer.write((json.dumps(request) + "\n").encode())
         await self.writer.drain()
 
-        line = await asyncio.wait_for(self.reader.readline(), timeout=self.timeout)
-        response = json.loads(line.decode())
+        # Read until we see the response whose id matches this
+        # request. Servers may interleave notifications (no id) or
+        # unrelated messages; skip them instead of desynchronizing.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.timeout
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError(
+                    f"No response for request {request['id']}"
+                )
+            line = await asyncio.wait_for(
+                self.reader.readline(), timeout=remaining
+            )
+            response = json.loads(line.decode())
 
-        if "error" in response:
-            raise MCPError(response["error"]["message"])
+            if response.get("id") != request["id"]:
+                continue  # Notification or unrelated message
 
-        return response.get("result", {})
+            if "error" in response:
+                raise MCPError(response["error"]["message"])
+
+            return response.get("result", {})
 
     async def _initialize(self):
         """Initialize the MCP connection."""
@@ -326,7 +375,20 @@ class MCPClient:
                            latency_ms=round(latency_ms, 2),
                            attempts=attempt + 1)
                 return parsed_result
-            except (MCPError, asyncio.TimeoutError, json.JSONDecodeError) as e:
+            except asyncio.TimeoutError as e:
+                # A timed-out call may still have executed on the
+                # server; retrying would silently re-execute tools
+                # that may not be idempotent, so fail fast instead.
+                latency_ms = (time.perf_counter() - start_time) * 1000
+                logger.error("Tool call timed out - not retrying",
+                            tool_name=name,
+                            attempt=attempt + 1,
+                            latency_ms=round(latency_ms, 2))
+                raise MCPError(
+                    f"Tool call '{name}' timed out; not retried "
+                    f"because the tool may not be idempotent"
+                ) from e
+            except (MCPError, json.JSONDecodeError) as e:
                 last_error = e
                 logger.warning("Tool call attempt failed",
                               tool_name=name,

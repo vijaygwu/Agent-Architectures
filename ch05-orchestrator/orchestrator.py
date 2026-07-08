@@ -286,6 +286,7 @@ class OrchestratorState(TypedDict):
     # Execution
     current_phase: int
     completed_subtasks: Annotated[list[str], operator.add]
+    failed_subtasks: Annotated[list[str], operator.add]
     results: Annotated[dict[str, Any], _merge_dicts]
 
     # Output
@@ -725,12 +726,18 @@ class MultiAgentOrchestrator:
         # Collect results
         phase_results = {}
         completed = []
+        failed = []
 
         for subtask_id, result in zip(phase_subtask_ids, results):
             subtask = subtasks_map[subtask_id]
             if isinstance(result, Exception):
                 subtask.status = "failed"
                 subtask.error = str(result)
+                failed.append(subtask_id)
+                logger.warning(
+                    f"Subtask {subtask_id} failed; dependent phases "
+                    f"will run without its results: {result}"
+                )
             else:
                 subtask.status = "completed"
                 subtask.result = result
@@ -740,6 +747,7 @@ class MultiAgentOrchestrator:
         return {
             "current_phase": current_phase + 1,
             "completed_subtasks": completed,
+            "failed_subtasks": failed,
             "results": phase_results
         }
 
@@ -854,9 +862,21 @@ class MultiAgentOrchestrator:
             state["results"]
         )
 
+        failed = state.get("failed_subtasks", [])
+        if failed and not state["results"]:
+            status = "failed"
+        elif failed:
+            status = "partial"
+        else:
+            status = "completed"
+
         return {
             "final_output": final_output,
-            "status": "completed"
+            "status": status,
+            "error": (
+                f"{len(failed)} subtask(s) failed: {failed}"
+                if failed else None
+            )
         }
 
     async def run(
@@ -887,6 +907,7 @@ class MultiAgentOrchestrator:
             "execution_plan": [],
             "current_phase": 0,
             "completed_subtasks": [],
+            "failed_subtasks": [],
             "results": {},
             "final_output": None,
             "status": "planning",

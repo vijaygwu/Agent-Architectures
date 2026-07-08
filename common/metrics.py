@@ -170,7 +170,10 @@ class MetricsCollector:
     - Gauge: Point-in-time value (active tasks, queue depth, memory usage)
     - Histogram: Distribution with buckets (latencies, request sizes)
 
-    Thread-safe for concurrent access in async environments.
+    Safe for concurrent use from a single asyncio event loop (all
+    methods are synchronous and never yield mid-update). NOT
+    thread-safe: wrap calls in a threading.Lock if you share one
+    collector across threads or executors.
 
     Args:
         namespace: Prefix for all metric names (e.g., "agent", "orchestrator")
@@ -222,9 +225,6 @@ class MetricsCollector:
         )
         self._histograms: dict[str, dict[str, HistogramData]] = defaultdict(dict)
         self._histogram_buckets: dict[str, tuple[float, ...]] = {}
-
-        # Thread safety
-        self._lock = asyncio.Lock()
 
     def _format_name(self, name: str) -> str:
         """Format metric name with namespace prefix."""

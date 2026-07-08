@@ -64,6 +64,7 @@ from typing import Any, Callable, Protocol, TypeVar
 from enum import Enum
 from abc import ABC, abstractmethod
 import asyncio
+import copy
 import json
 import logging
 import time
@@ -456,13 +457,13 @@ class GuardedOrchestrator:
 
             return result
 
-        # Temporarily replace tool executor (with lock for thread safety)
-        async with self._execution_lock:
-            worker.execute_tool = guarded_tool_execution
-            try:
-                result = await worker.execute(subtask, context)
-            finally:
-                worker.execute_tool = original_execute_tool
+        # Run the guarded execution on a per-call shallow copy of the
+        # worker: patching the copy's tool executor leaves the shared
+        # worker untouched and lets guarded subtasks run in parallel
+        # instead of serializing on one global lock.
+        guarded_worker = copy.copy(worker)
+        guarded_worker.execute_tool = guarded_tool_execution
+        result = await guarded_worker.execute(subtask, context)
 
         return result
 
@@ -1100,8 +1101,15 @@ Respond with JSON:
             {"role": "user", "content": analysis_prompt}
         ])
 
-        data = json.loads(response.content)
-        return TaskCharacteristics(**data)
+        try:
+            data = json.loads(response.content)
+            return TaskCharacteristics(**data)
+        except (json.JSONDecodeError, TypeError) as e:
+            logger.warning(
+                f"Task analysis returned malformed JSON; using "
+                f"default characteristics: {e}"
+            )
+            return TaskCharacteristics()
 
     def score_patterns(
         self,
@@ -1348,15 +1356,26 @@ Return JSON:
             {"role": "user", "content": planning_prompt}
         ])
 
-        phase_data = json.loads(response.content)
-        return [
-            PipelinePhase(
-                id=p["id"],
-                description=p["description"],
-                dependencies=p.get("dependencies", [])
+        try:
+            phase_data = json.loads(response.content)
+            return [
+                PipelinePhase(
+                    id=p["id"],
+                    description=p["description"],
+                    dependencies=p.get("dependencies", [])
+                )
+                for p in phase_data
+            ]
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            logger.warning(
+                f"Phase planning returned malformed JSON; falling "
+                f"back to a single phase: {e}"
             )
-            for p in phase_data
-        ]
+            return [PipelinePhase(
+                id="phase_1",
+                description=task,
+                dependencies=[]
+            )]
 
     def order_phases(self, phases: list[PipelinePhase]) -> list[PipelinePhase]:
         """Topologically sort phases by dependencies."""

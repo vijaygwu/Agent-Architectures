@@ -14,9 +14,11 @@ Production Notes:
 """
 
 import asyncio
+import ipaddress
 import json
 import os
 import signal
+import socket
 import time
 from dataclasses import dataclass, asdict
 from typing import Any
@@ -366,6 +368,26 @@ async def fetch_url(url: str, max_length: int = 10000) -> dict:
         "max_length": max_length
     })
 
+    # SSRF guard: allow only http(s) URLs on public addresses.
+    if parsed.scheme not in ("http", "https"):
+        return {"success": False,
+                "error": f"Unsupported URL scheme: {parsed.scheme}",
+                "url": url}
+    try:
+        infos = await asyncio.get_running_loop().getaddrinfo(
+            parsed.hostname, None
+        )
+    except (socket.gaierror, TypeError) as e:
+        return {"success": False,
+                "error": f"Could not resolve host: {e}", "url": url}
+    for info in infos:
+        addr = ipaddress.ip_address(info[4][0])
+        if (addr.is_private or addr.is_loopback
+                or addr.is_link_local or addr.is_reserved):
+            return {"success": False,
+                    "error": "URL resolves to a private address",
+                    "url": url}
+
     # Check circuit breaker before making external call
     if not _fetch_circuit_breaker.allow():
         logger.warning("Fetch request rejected - circuit breaker open", extra={
@@ -382,12 +404,23 @@ async def fetch_url(url: str, max_length: int = 10000) -> dict:
                 timeout = aiohttp.ClientTimeout(total=30)
                 async with session.get(url, timeout=timeout) as response:
                     if response.status == 200:
-                        content = await response.text()
+                        # Stream at most max_length bytes rather than
+                        # buffering the whole body in memory.
+                        raw = await response.content.read(max_length + 1)
+                        try:
+                            content = raw.decode(
+                                response.charset or "utf-8",
+                                errors="replace"
+                            )
+                        except LookupError:
+                            content = raw.decode(
+                                "utf-8", errors="replace"
+                            )
                         return {
                             "success": True,
                             "url": url,
                             "content": content[:max_length],
-                            "truncated": len(content) > max_length,
+                            "truncated": len(raw) > max_length,
                             "content_type": response.headers.get(
                                 "Content-Type", "unknown")
                         }
@@ -654,6 +687,19 @@ async def run_stdio_server(shutdown_event: asyncio.Event = None):
         except json.JSONDecodeError:
             error_response = JsonRpcResponse(
                 error={"code": -32700, "message": "Parse error"}
+            )
+            writer.write((json.dumps(asdict(error_response)) + "\n").encode())
+            await writer.drain()
+        except Exception as e:
+            # Keep serving on unexpected failures (e.g. upstream
+            # aiohttp errors re-raised by tool handlers): return a
+            # JSON-RPC internal error instead of crashing the loop.
+            logger.error("Unhandled server error", extra={
+                "error_type": type(e).__name__,
+                "error_message": str(e)
+            })
+            error_response = JsonRpcResponse(
+                error={"code": -32603, "message": "Internal error"}
             )
             writer.write((json.dumps(asdict(error_response)) + "\n").encode())
             await writer.drain()
